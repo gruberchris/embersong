@@ -111,6 +111,26 @@ struct Session {
     last_bard: Option<(BardZone, u8)>,
 }
 
+/// Pause modal on the overworld (Explore only).
+#[derive(Resource, Default)]
+struct PauseMenu {
+    open: bool,
+}
+
+#[derive(Component)]
+struct PauseMenuUI;
+
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+enum PauseBtn {
+    Resume,
+    Quit,
+}
+
+/// Pure gate: no overworld input while the modal is up.
+fn explore_blocked(paused: &PauseMenu) -> bool {
+    paused.open
+}
+
 #[derive(Clone)]
 struct GenMap {
     vault: usize,
@@ -773,8 +793,125 @@ fn explore_setup(
             ExploreScreen,
         ))
         .with_children(|p| {
-            p.spawn((Text::new("WASD move · E seek foe · R rest"), f_help, c_help));
+            p.spawn((
+                Text::new("WASD move · E seek foe · R rest · ESC menu"),
+                f_help,
+                c_help,
+            ));
         });
+}
+
+/// Centered pause modal: dim veil + panel with Resume / Quit Game.
+fn spawn_pause_menu(commands: &mut Commands, asset_server: &AssetServer) {
+    commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.02, 0.02, 0.05, 0.72)),
+            ExploreScreen,
+            PauseMenuUI,
+        ))
+        .with_children(|veil| {
+            veil.spawn((
+                Node {
+                    width: Val::Px(320.0),
+                    height: Val::Px(300.0),
+                    flex_direction: FlexDirection::Column,
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    row_gap: Val::Px(12.0),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.16, 0.12, 0.26)),
+            ))
+            .with_children(|panel| {
+                let (f_title, c_title) = font(asset_server, 28.0, Color::srgb(1.0, 0.88, 0.6));
+                panel.spawn((Text::new("PAUSED"), f_title, c_title));
+                for (kind, label) in [(PauseBtn::Resume, "Resume"), (PauseBtn::Quit, "Quit Game")] {
+                    let (f, c) = font(asset_server, 18.0, Color::WHITE);
+                    panel
+                        .spawn((
+                            Button,
+                            kind,
+                            Node {
+                                width: Val::Px(220.0),
+                                height: Val::Px(52.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                ..default()
+                            },
+                            BackgroundColor(BTN_NORMAL),
+                        ))
+                        .with_children(|b| {
+                            b.spawn((Text::new(label), f, c));
+                        });
+                }
+                let (f_hint, c_hint) = font(asset_server, 14.0, Color::srgb(0.7, 0.68, 0.8));
+                panel.spawn((Text::new("ESC resume · Q quit"), f_hint, c_hint));
+            });
+        });
+}
+
+fn pause_toggle(
+    mut commands: Commands,
+    keys: Res<ButtonInput<KeyCode>>,
+    asset_server: Res<AssetServer>,
+    mut paused: ResMut<PauseMenu>,
+    session: Res<Session>,
+    menu_q: Query<Entity, With<PauseMenuUI>>,
+) {
+    if keys.just_pressed(KeyCode::Escape) {
+        paused.open = !paused.open;
+        if paused.open {
+            spawn_pause_menu(&mut commands, &asset_server);
+        } else {
+            for e in &menu_q {
+                commands.entity(e).despawn_recursive();
+            }
+        }
+    } else if paused.open && keys.just_pressed(KeyCode::KeyQ) {
+        save_game(&session.game);
+        std::process::exit(0);
+    }
+}
+
+#[allow(clippy::type_complexity)] // Bevy button-interaction query.
+fn pause_buttons(
+    mut commands: Commands,
+    mut q: Query<
+        (&Interaction, &mut BackgroundColor, &PauseBtn),
+        (Changed<Interaction>, With<Button>),
+    >,
+    mut paused: ResMut<PauseMenu>,
+    session: Res<Session>,
+    menu_q: Query<Entity, With<PauseMenuUI>>,
+) {
+    for (interaction, mut color, btn) in &mut q {
+        match *interaction {
+            Interaction::Pressed => {
+                *color = BTN_DOWN.into();
+                match btn {
+                    PauseBtn::Resume => {
+                        paused.open = false;
+                        for e in &menu_q {
+                            commands.entity(e).despawn_recursive();
+                        }
+                    }
+                    PauseBtn::Quit => {
+                        save_game(&session.game);
+                        std::process::exit(0);
+                    }
+                }
+            }
+            Interaction::Hovered => *color = BTN_HOVER.into(),
+            Interaction::None => *color = BTN_NORMAL.into(),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // Bevy systems take their params as args.
@@ -788,7 +925,12 @@ fn explore_move(
     mut player_q: Query<&mut Transform, (With<PlayerToken>, Without<PlayerGlow>)>,
     mut glow_q: Query<&mut Transform, (With<PlayerGlow>, Without<PlayerToken>)>,
     sprites: Res<SpriteSet>,
+    paused: Res<PauseMenu>,
 ) {
+    // Modal up: freeze overworld input (ESC/Q still handled by pause systems).
+    if explore_blocked(&paused) {
+        return;
+    }
     // The core auto-advanced to the next vault after a clear: rebuild the map.
     if session.map.vault != session.game.vault_index {
         for e in &tiles {
@@ -1432,6 +1574,7 @@ fn main() {
         .insert_resource(BackendRes(Mutex::new(backend)))
         .insert_resource(SoundBus::spawn())
         .insert_resource(CombatClock::default())
+        .insert_resource(PauseMenu::default())
         .add_systems(Startup, (setup_once, build_sprites))
         .add_systems(OnEnter(AppState::Title), title_setup)
         .add_systems(OnExit(AppState::Title), despawn_all::<TitleScreen>)
@@ -1450,6 +1593,8 @@ fn main() {
             Update,
             (
                 title_keys.run_if(in_state(AppState::Title)),
+                pause_toggle.run_if(in_state(AppState::Explore)),
+                pause_buttons.run_if(in_state(AppState::Explore)),
                 explore_move.run_if(in_state(AppState::Explore)),
                 explore_hud.run_if(in_state(AppState::Explore)),
                 tick_combat_clock,
@@ -1625,6 +1770,15 @@ mod host_tests {
         // Single-track build today, but the helper must already handle it.
         assert!(needs_music_restart(Some(1), 0));
         assert!(!needs_music_restart(Some(0), 0));
+    }
+
+    #[test]
+    fn pause_menu_starts_closed_and_blocks_input() {
+        let paused = PauseMenu::default();
+        assert!(!paused.open);
+        assert!(!explore_blocked(&paused));
+        let open = PauseMenu { open: true };
+        assert!(explore_blocked(&open));
     }
 
     #[test]
