@@ -1,0 +1,10 @@
+[package]
+name = "embersong-synth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Procedural SFX and bard-song synthesis for Embersong (no audio assets, no backend)"
+
+[dependencies]
+embersong-core = { workspace = true }

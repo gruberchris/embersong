@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/embersong-core",
+    "crates/embersong-wasm",
+    "crates/embersong-host",
+    "crates/embersong-synth",
+    "crates/xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.78"
+license = "MIT"
+authors = ["Chris Gruber <gruber.christopher@gmail.com>"]
+homepage = "https://github.com/gruberchris/embersong"
+repository = "https://github.com/gruberchris/embersong"
+
+[workspace.dependencies]
+embersong-core = { path = "crates/embersong-core" }
+embersong-synth = { path = "crates/embersong-synth" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = { version = "0.8", default-features = false }
+rand_chacha = { version = "0.3", features = ["serde1"] }

@@ -1,0 +1,24 @@
+[package]
+name = "embersong-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Native desktop host for Embersong: Bevy isometric renderer + wasmtime WASM guest loader"
+
+[[bin]]
+name = "embersong-host"
+path = "src/main.rs"
+
+[dependencies]
+embersong-core = { workspace = true }
+embersong-synth = { workspace = true }
+embersong-wasm = { path = "../embersong-wasm" }
+bevy = "0.15"
+wasmtime = "34"
+rodio = "0.20"
+serde.workspace = true
+serde_json = "1"
+
+[dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }

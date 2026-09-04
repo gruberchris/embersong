@@ -1,0 +1,13 @@
+[package]
+name = "embersong-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Pure deterministic game logic for Embersong (native + wasm32-unknown-unknown)"
+
+[dependencies]
+serde.workspace = true
+serde_json = "1"
+rand.workspace = true
+rand_chacha.workspace = true

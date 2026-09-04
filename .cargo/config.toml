@@ -1,0 +1,4 @@
+# The WASM guest (`embersong-wasm`) is pure computation with no OS surface, so
+# it targets `wasm32-unknown-unknown` (zero imports) and aborts on panic.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "panic=abort"]
