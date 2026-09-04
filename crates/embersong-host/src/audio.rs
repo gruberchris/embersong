@@ -11,6 +11,7 @@ enum AudioCmd {
     Sfx(Vec<f32>, u32),
     Music(Vec<f32>, u32),
     StopMusic,
+    StopSfx,
 }
 
 #[derive(Resource)]
@@ -53,6 +54,9 @@ impl SoundBus {
                             music_sink.append(src);
                         }
                         AudioCmd::StopMusic => music_sink.stop(),
+                        // Death/run-end: drop the mash backlog so queued
+                        // blows don't keep playing over the End screen.
+                        AudioCmd::StopSfx => sfx_sink.stop(),
                     }
                 }
             })
@@ -79,6 +83,11 @@ impl SoundBus {
     /// Silence music (combat exit, new run). SFX in flight are untouched.
     pub fn stop_music(&self) {
         self.send(AudioCmd::StopMusic);
+    }
+
+    /// Drop queued SFX (run end). The caller replays one clean sting after.
+    pub fn stop_sfx(&self) {
+        self.send(AudioCmd::StopSfx);
     }
 
     pub fn play_trigger(&self, trigger: embersong_core::SoundTrigger) {
@@ -117,5 +126,17 @@ mod tests {
         ] {
             bus.play_trigger(t);
         }
+    }
+
+    #[test]
+    fn sfx_stop_clears_backlog() {
+        // Regression: mashing actions queued seconds of SFX that kept
+        // playing after death. Stop must be sendable mid-spam.
+        let bus = SoundBus::spawn();
+        for _ in 0..20 {
+            bus.play_trigger(embersong_core::SoundTrigger::Strike);
+        }
+        bus.stop_sfx();
+        bus.play_trigger(embersong_core::SoundTrigger::Defeat);
     }
 }

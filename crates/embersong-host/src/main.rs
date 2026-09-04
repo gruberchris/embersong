@@ -70,17 +70,33 @@ fn combat_glow_color(mode: LightingMode) -> Color {
 }
 
 /// Wall-clock seconds since the current fight started (bard clock),
-/// plus which battle track the music sink is currently playing.
+/// which battle track the music sink is playing, and the input cooldown
+/// until the next action may fire (it paces presses to the sounds they made).
 #[derive(Resource, Default)]
 struct CombatClock {
     elapsed: f32,
     music_track: Option<u32>,
+    cooldown: f32,
 }
 
 /// True when the sink holds a different track than the current fight
 /// (kill/bind starts a new fight mid-Combat): restart music.
 fn needs_music_restart(known: Option<u32>, current: u32) -> bool {
     known != Some(current)
+}
+
+/// Cooldown after an action so presses can't outrun the sounds they queued:
+/// the summed SFX length of the turn's events, clamped to a playable band.
+/// Pure helper (UI-only; never fed back into core, so replays stay identical).
+fn action_cooldown(events: &[Event]) -> f32 {
+    let total: f32 = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Sound(t) => Some(embersong_synth::sfx_duration(*t)),
+            _ => None,
+        })
+        .sum();
+    total.clamp(0.3, 1.0)
 }
 
 #[derive(Resource)]
@@ -564,6 +580,8 @@ fn begin_run(session: &mut Session, bus: &SoundBus, game: Game, next: &mut NextS
         "The lantern is lit. Hollow Hill waits.".to_string(),
     );
     let bed = embersong_synth::render_song_bed(2, false);
+    // Cut any lingering sting (e.g. mashing R through the End screen).
+    bus.stop_sfx();
     bus.play_music(bed.samples, bed.rate);
     next.set(AppState::Explore);
 }
@@ -867,6 +885,7 @@ fn combat_setup(
     mut clock: ResMut<CombatClock>,
 ) {
     clock.elapsed = 0.0;
+    clock.cooldown = 0.0;
     session.last_bard = None;
     let mode = lighting_for_vault(session.game.vault_index);
     // Brightened full-screen backdrop (spawned first so it sits behind).
@@ -1035,6 +1054,7 @@ fn combat_setup(
 fn combat_hud(
     session: Res<Session>,
     sprites: Res<SpriteSet>,
+    clock: Res<CombatClock>,
     mut hud: Query<
         &mut Text,
         (
@@ -1050,7 +1070,10 @@ fn combat_hud(
     mut foe: Query<&mut Sprite, With<CombatFoe>>,
     mut last_kind: Local<Option<MonsterKind>>,
 ) {
-    let body = format!("{}\n{}", hero_line(&session.game), foe_line(&session.game));
+    let mut body = format!("{}\n{}", hero_line(&session.game), foe_line(&session.game));
+    if clock.cooldown > 0.0 {
+        body.push_str("\n♪ verse resolving…");
+    }
     for mut t in &mut hud {
         t.0 = body.clone();
     }
@@ -1098,7 +1121,7 @@ fn combat_keys(
     backend: Res<BackendRes>,
     bus: Res<SoundBus>,
     sprites: Res<SpriteSet>,
-    clock: Res<CombatClock>,
+    mut clock: ResMut<CombatClock>,
     foe_q: Query<&Transform, With<CombatFoe>>,
     mut next: ResMut<NextState<AppState>>,
 ) {
@@ -1120,9 +1143,15 @@ fn combat_keys(
         let verse = song_name(&session);
         push_log(&mut session, format!("Verse ready: {verse}"));
     }
+    // Verse resolving: ignore action presses until the last turn's sounds
+    // have had room to play, so mashing can't lap the audio queue.
+    if clock.cooldown > 0.0 {
+        return;
+    }
     if let Some(action) = act {
         let beat = Some(clock.elapsed);
         let events = do_hero_action(&mut session, &backend, &bus, action, beat, &mut next);
+        clock.cooldown = action_cooldown(&events);
         let foe_pos = foe_q
             .iter()
             .next()
@@ -1148,7 +1177,7 @@ fn combat_buttons(
     backend: Res<BackendRes>,
     bus: Res<SoundBus>,
     sprites: Res<SpriteSet>,
-    clock: Res<CombatClock>,
+    mut clock: ResMut<CombatClock>,
     foe_q: Query<&Transform, (With<CombatFoe>, Without<BardNote>)>,
     mut next: ResMut<NextState<AppState>>,
 ) {
@@ -1156,6 +1185,11 @@ fn combat_buttons(
         match *interaction {
             Interaction::Pressed => {
                 *color = BTN_DOWN.into();
+                // Button visuals still update while cooling, but the press
+                // is swallowed so mashing can't lap the audio queue.
+                if clock.cooldown > 0.0 {
+                    continue;
+                }
                 let action = match btn.0 {
                     BtnKind::Strike => Action::Strike,
                     BtnKind::Song => Action::Song(SONGS[session.song_idx]),
@@ -1166,6 +1200,7 @@ fn combat_buttons(
                 };
                 let beat = Some(clock.elapsed);
                 let events = do_hero_action(&mut session, &backend, &bus, action, beat, &mut next);
+                clock.cooldown = action_cooldown(&events);
                 let foe_pos = foe_q
                     .iter()
                     .next()
@@ -1195,6 +1230,7 @@ fn tick_combat_clock(
         return;
     }
     clock.elapsed += time.delta_secs();
+    clock.cooldown = (clock.cooldown - time.delta_secs()).max(0.0);
     // A kill/bind picks a new track for the next foe without leaving Combat:
     // stop the stale loop and start the new fight's song.
     if needs_music_restart(clock.music_track, session.game.battle_track) {
@@ -1205,10 +1241,12 @@ fn tick_combat_clock(
     }
 }
 
-/// Leaving a fight silences its music; the next screen starts its own bed.
+/// Leaving a fight silences it: music stops (the next screen starts its own
+/// bed) and queued SFX are dropped so mash backlog can't chase into End.
 /// (Without this the 8-loop combat render kept playing under menu beds.)
-fn stop_music_on_exit(bus: Res<SoundBus>) {
+fn stop_audio_on_exit(bus: Res<SoundBus>) {
     bus.stop_music();
+    bus.stop_sfx();
 }
 
 fn bard_note_rise_fade(
@@ -1238,7 +1276,20 @@ fn foe_pulse(time: Res<Time>, mut q: Query<&mut Transform, With<CombatFoe>>) {
 // End
 // ---------------------------------------------------------------------------
 
-fn end_setup(mut commands: Commands, asset_server: Res<AssetServer>, session: Res<Session>) {
+fn end_setup(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    session: Res<Session>,
+    bus: Res<SoundBus>,
+) {
+    // The exit stop above wiped the final turn's blows too: replay exactly
+    // one clean sting for the outcome.
+    bus.stop_sfx();
+    match session.game.phase {
+        Phase::Victory => bus.play_trigger(embersong_core::SoundTrigger::Victory),
+        _ if session.game.hero.hp <= 0 => bus.play_trigger(embersong_core::SoundTrigger::Defeat),
+        _ => {}
+    }
     let (title, color) = match session.game.phase {
         Phase::Victory => ("✦ ALL VAULTS SING ✦", Color::srgb(1.0, 0.9, 0.55)),
         _ if session.game.hero.hp <= 0 => ("THE LANTERN GUTTERS OUT", Color::srgb(0.9, 0.4, 0.4)),
@@ -1368,7 +1419,7 @@ fn main() {
         .add_systems(OnEnter(AppState::Combat), combat_setup)
         .add_systems(
             OnExit(AppState::Combat),
-            (despawn_all::<CombatScreen>, stop_music_on_exit),
+            (despawn_all::<CombatScreen>, stop_audio_on_exit),
         )
         .add_systems(OnEnter(AppState::End), end_setup)
         .add_systems(OnExit(AppState::End), despawn_all::<EndScreen>)
@@ -1559,5 +1610,33 @@ mod host_tests {
         let clock = CombatClock::default();
         assert_eq!(clock.elapsed, 0.0);
         assert_eq!(clock.music_track, None);
+        assert_eq!(clock.cooldown, 0.0);
+    }
+
+    #[test]
+    fn action_cooldown_tracks_sound_but_stays_playable() {
+        use embersong_core::SoundTrigger;
+        // Silence still costs the floor, so machine-gunning is impossible.
+        assert_eq!(action_cooldown(&[]), 0.3);
+        // A lone miss blip floors too.
+        let miss = vec![Event::Sound(SoundTrigger::Miss)];
+        assert_eq!(action_cooldown(&miss), 0.3);
+        // A typical strike turn paces to its sounds.
+        let turn = vec![
+            Event::Sound(SoundTrigger::Strike),
+            Event::Sound(SoundTrigger::HeroHurt),
+        ];
+        let cd = action_cooldown(&turn);
+        assert!(cd > 0.3 && cd < 1.0, "{cd}");
+        // A huge turn (kill + victory sting) caps instead of freezing input.
+        let big = vec![
+            Event::Sound(SoundTrigger::Strike),
+            Event::Sound(SoundTrigger::MonsterDie),
+            Event::Sound(SoundTrigger::Victory),
+        ];
+        assert_eq!(action_cooldown(&big), 1.0);
+        // Non-sound events don't extend the wait.
+        let chat = vec![Event::Message("hi".into())];
+        assert_eq!(action_cooldown(&chat), 0.3);
     }
 }

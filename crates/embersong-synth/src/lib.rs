@@ -133,6 +133,14 @@ pub fn render_sfx(trigger: SoundTrigger) -> Sound {
     Sound { samples, rate }
 }
 
+/// Playback length of a one-shot effect in seconds, for UI pacing
+/// (action cooldowns). Renders the effect and measures it, so the value
+/// can never drift from what the audio thread actually plays.
+pub fn sfx_duration(trigger: SoundTrigger) -> f32 {
+    let s = render_sfx(trigger);
+    s.samples.len() as f32 / s.rate.max(1) as f32
+}
+
 /// MIDI note to frequency (A4 = 440Hz).
 pub fn midi_to_freq(midi: u8) -> f32 {
     440.0 * 2.0f32.powf((midi as f32 - 69.0) / 12.0)
@@ -240,5 +248,35 @@ mod tests {
     fn midi_to_freq_matches_a440() {
         assert!((midi_to_freq(69) - 440.0).abs() < 0.5);
         assert!(midi_to_freq(81) > midi_to_freq(57));
+    }
+
+    #[test]
+    fn sfx_durations_are_sane_and_match_render() {
+        // Every trigger must report the length it really plays: short blips
+        // well under a second, stings capped for cooldown math.
+        for t in [
+            SoundTrigger::Strike,
+            SoundTrigger::HeroHurt,
+            SoundTrigger::MonsterDie,
+            SoundTrigger::Heal,
+            SoundTrigger::Miss,
+            SoundTrigger::Tame,
+            SoundTrigger::Song,
+            SoundTrigger::Enrage,
+            SoundTrigger::Flee,
+            SoundTrigger::Victory,
+            SoundTrigger::Defeat,
+            SoundTrigger::BardHigh,
+            SoundTrigger::BardLow,
+        ] {
+            let d = sfx_duration(t);
+            assert!(d > 0.05 && d < 1.5, "{t:?} duration {d}");
+            let s = render_sfx(t);
+            let expect = s.samples.len() as f32 / s.rate as f32;
+            assert!((d - expect).abs() < f32::EPSILON, "{t:?}");
+        }
+        // Spot checks the cooldown math relies on.
+        assert!(sfx_duration(SoundTrigger::Miss) < 0.2);
+        assert!(sfx_duration(SoundTrigger::Victory) > 1.0);
     }
 }
