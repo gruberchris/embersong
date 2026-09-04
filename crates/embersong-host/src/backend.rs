@@ -164,11 +164,12 @@ impl Backend {
     }
 
     /// Run one hero turn; on WASM failure, degrade to native for this turn.
-    pub fn act(&mut self, game: &mut Game, action: Action) -> Vec<Event> {
+    /// `beat_time`: wall-clock seconds since the fight started (bard clock).
+    pub fn act(&mut self, game: &mut Game, action: Action, beat_time: Option<f32>) -> Vec<Event> {
         match self {
-            Backend::Native => game.act(action),
+            Backend::Native => game.act_at(action, beat_time),
             Backend::Wasm(g) => {
-                match g.roundtrip(game, &Command::Act { action }) {
+                match g.roundtrip(game, &Command::Act { action, beat_time }) {
                     Ok(res) => {
                         // Guest JSON skips the transient RNG; it restarts
                         // deterministically from the seed on next load.
@@ -177,7 +178,7 @@ impl Backend {
                     }
                     Err(e) => {
                         eprintln!("embersong: guest failed ({e}); native fallback for this turn");
-                        game.act(action)
+                        game.act_at(action, beat_time)
                     }
                 }
             }

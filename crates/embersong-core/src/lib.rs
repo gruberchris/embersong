@@ -210,6 +210,95 @@ impl Song {
 }
 
 // ---------------------------------------------------------------------------
+// Bard battle songs: one looping synth track per fight, note-timed bonuses.
+// ---------------------------------------------------------------------------
+
+/// Which third of the track's range a sampled note fell in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BardZone {
+    High,
+    Mid,
+    Low,
+}
+
+impl BardZone {
+    pub fn label(self) -> &'static str {
+        match self {
+            BardZone::High => "high verse",
+            BardZone::Mid => "steady verse",
+            BardZone::Low => "low verse",
+        }
+    }
+}
+
+/// A battle song track: MIDI note sequence looped with a fixed step duration.
+/// Core owns the note tables (game data); `embersong-synth` renders them.
+#[derive(Debug, Clone, Copy)]
+pub struct BattleTrack {
+    pub name: &'static str,
+    pub notes: &'static [u8],
+    pub note_dur: f32,
+}
+
+/// First test track: Ember Vanguard March, 16 steps across ~2 octaves so the
+/// per-track thirds split is meaningful (min 57, max 81).
+pub const EMBER_VANGUARD_NOTES: &[u8] = &[
+    57, 60, 62, 64, 67, 69, 72, 74, 76, 79, 81, 79, 76, 72, 69, 64,
+];
+
+pub const EMBER_VANGUARD_DUR: f32 = 0.22;
+
+pub fn battle_track_count() -> usize {
+    1
+}
+
+pub fn battle_track(idx: u32) -> BattleTrack {
+    // Single test track for now; the registry grows by pushing here.
+    let _ = idx;
+    BattleTrack {
+        name: "Ember Vanguard March",
+        notes: EMBER_VANGUARD_NOTES,
+        note_dur: EMBER_VANGUARD_DUR,
+    }
+}
+
+pub fn battle_track_name(idx: u32) -> &'static str {
+    battle_track(idx).name
+}
+
+/// Sample the looping note at `elapsed` seconds since the fight started.
+pub fn bard_note_at(track_idx: u32, elapsed: f32) -> (usize, u8) {
+    let t = battle_track(track_idx);
+    let len = t.notes.len().max(1);
+    let t_sec = if elapsed < 0.0 { 0.0 } else { elapsed };
+    let step = (t_sec / t.note_dur.max(0.01)).floor() as usize;
+    let i = step % len;
+    (i, t.notes[i])
+}
+
+/// Per-track thirds: bottom third = Low, top third = High, else Mid.
+pub fn classify_bard_note(track_idx: u32, midi: u8) -> BardZone {
+    let t = battle_track(track_idx);
+    let (mut lo, mut hi) = (u8::MAX, u8::MIN);
+    for n in t.notes {
+        lo = lo.min(*n);
+        hi = hi.max(*n);
+    }
+    if hi <= lo {
+        return BardZone::Mid;
+    }
+    let span = (hi - lo) as f32;
+    let v = (midi.saturating_sub(lo)) as f32;
+    if v <= span / 3.0 {
+        BardZone::Low
+    } else if v > span * 2.0 / 3.0 {
+        BardZone::High
+    } else {
+        BardZone::Mid
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Live entities
 // ---------------------------------------------------------------------------
 
@@ -449,17 +538,33 @@ impl Hero {
     }
 
     /// Python `Hero.attack` port. Returns damage dealt.
-    fn strike(&mut self, m: &mut Monster, rng: &mut ChaCha8Rng) -> i32 {
+    /// Bard rule (mixed crit-style): High auto-hits and +50% (ceil),
+    /// Low is -2 (min 0) with a lower effective hit rate, Mid unchanged.
+    fn strike(&mut self, m: &mut Monster, rng: &mut ChaCha8Rng, bard: BardZone) -> i32 {
         let mut dmg = rng.gen_range(1..=self.damage.max(1));
         if rng.gen::<f32>() < 0.3 {
             dmg += (dmg as f32 * 0.5) as i32;
         }
-        if rng.gen::<f32>() > self.hit {
+        let effective_hit = match bard {
+            BardZone::High => 2.0, // auto-hit: any gen::<f32>() <= 2.0
+            BardZone::Low => (self.hit - 0.25).max(0.05),
+            BardZone::Mid => self.hit,
+        };
+        if rng.gen::<f32>() > effective_hit {
             return 0;
         }
         if self.verse_power > 0 {
             dmg += 2;
             self.verse_power -= 1;
+        }
+        match bard {
+            BardZone::High => {
+                dmg = ((dmg as f32 * 1.5).ceil() as i32).max(1);
+            }
+            BardZone::Low => {
+                dmg = (dmg - 2).max(0);
+            }
+            BardZone::Mid => {}
         }
         if m.enraged {
             dmg /= 2; // Python mitigation rule.
@@ -520,12 +625,20 @@ pub enum SoundTrigger {
     Flee,
     Victory,
     Defeat,
+    BardHigh,
+    BardLow,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Event {
     Message(String),
     Sound(SoundTrigger),
+    BardBeat {
+        track: u32,
+        note_idx: usize,
+        midi: u8,
+        zone: BardZone,
+    },
     Tamed(MonsterKind),
     Evolved {
         from: MonsterKind,
@@ -624,6 +737,10 @@ pub struct Game {
     /// Serialized too (rand_chacha serde): the stream continues across
     /// save/load and across the native↔WASM boundary identically.
     pub rng: Option<ChaCha8Rng>,
+    /// Randomly selected battle song track for the current fight.
+    /// `#[serde(default)]` keeps pre-bard saves loadable (defaults to 0).
+    #[serde(default)]
+    pub battle_track: u32,
 }
 
 impl Game {
@@ -637,6 +754,7 @@ impl Game {
             fled: false,
             seed,
             rng: Some(ChaCha8Rng::seed_from_u64(seed)),
+            battle_track: 0,
         };
         g.enter_vault(0);
         g
@@ -713,6 +831,13 @@ impl Game {
         };
         let kind = self.queue.remove(i);
         self.current = Some(Monster::spawn(kind));
+        // A new fight starts: randomly select a battle song track.
+        let count = battle_track_count().max(1) as u32;
+        let t = {
+            let r = self.rng_mut();
+            r.gen_range(0..count)
+        };
+        self.battle_track = t;
     }
 
     pub fn alive(&self) -> bool {
@@ -720,7 +845,16 @@ impl Game {
     }
 
     /// One hero turn + monster reply. Returns the event log for UI + audio.
+    /// Wall-clock entry point defers to [`Game::act_at`] with a synthetic
+    /// turn-stepped clock so headless sims stay deterministic.
     pub fn act(&mut self, action: Action) -> Vec<Event> {
+        self.act_at(action, None)
+    }
+
+    /// Turn driver with an explicit bard clock.
+    /// `beat_time`: seconds since the fight started (host wall-clock).
+    /// `None` = synthetic `turns * note_dur` fallback for tests/headless.
+    pub fn act_at(&mut self, action: Action, beat_time: Option<f32>) -> Vec<Event> {
         let mut log = Vec::new();
         if !self.alive() || self.phase == Phase::GameOver || self.phase == Phase::Victory {
             return log;
@@ -728,6 +862,14 @@ impl Game {
         self.hero.turns += 1;
         // Breath refreshes slowly (bard rhythm).
         self.hero.breath = (self.hero.breath + 1).min(self.hero.max_breath);
+
+        // Bard beat: sample the looping battle song at the moment of action.
+        // `None` falls back to a turn-stepped clock so sims/tests are stable.
+        let track = self.battle_track;
+        let step_dur = battle_track(track).note_dur;
+        let clock = beat_time.unwrap_or(self.hero.turns.max(0) as f32 * step_dur);
+        let (note_idx, midi) = bard_note_at(track, clock);
+        let zone = classify_bard_note(track, midi);
 
         match action {
             Action::Flee => {
@@ -742,6 +884,12 @@ impl Game {
                 return log;
             }
             Action::Heal => {
+                log.push(Event::BardBeat {
+                    track,
+                    note_idx,
+                    midi,
+                    zone,
+                });
                 let seed = self.seed;
                 let rng = Self::rng_field(&mut self.rng, seed);
                 self.hero.heal_self(rng, &mut log);
@@ -751,34 +899,72 @@ impl Game {
                     // Disjoint field borrows: rng + hero + current.
                     let seed = self.seed;
                     let rng = Self::rng_field(&mut self.rng, seed);
-                    let dmg = self.hero.strike(mon, rng);
+                    let dmg = self.hero.strike(mon, rng, zone);
+                    log.push(Event::BardBeat {
+                        track,
+                        note_idx,
+                        midi,
+                        zone,
+                    });
                     // NLL ends the borrows above; re-read for the message.
                     if dmg > 0 {
                         let m = self.current.as_ref().expect("foe present");
+                        let bard_tag = match zone {
+                            BardZone::High => " ♪ high verse! +50%, true strike!",
+                            BardZone::Low => " ♭ low verse... -2.",
+                            BardZone::Mid => "",
+                        };
                         if m.enraged {
                             log.push(Event::message(format!(
-                                "You strike the {} but rage halves it to {dmg}!",
+                                "You strike the {} but rage halves it to {dmg}!{bard_tag}",
                                 m.name
                             )));
                         } else {
                             log.push(Event::message(format!(
-                                "You strike the {} for {dmg}!",
+                                "You strike the {} for {dmg}!{bard_tag}",
                                 m.name
                             )));
                         }
                         log.push(Event::sound(SoundTrigger::Strike));
                     } else {
                         let m = self.current.as_ref().expect("foe present");
-                        log.push(Event::message(format!("You miss the {}!", m.name)));
+                        let bard_tag = match zone {
+                            BardZone::Low => " (low verse falters)",
+                            BardZone::High => " (high verse rings true)",
+                            BardZone::Mid => "",
+                        };
+                        log.push(Event::message(format!(
+                            "You miss the {}!{bard_tag}",
+                            m.name
+                        )));
                         log.push(Event::sound(SoundTrigger::Miss));
+                    }
+                    match zone {
+                        BardZone::High => log.push(Event::sound(SoundTrigger::BardHigh)),
+                        BardZone::Low => log.push(Event::sound(SoundTrigger::BardLow)),
+                        BardZone::Mid => {}
                     }
                     self.check_kill(&mut log);
                 } else {
                     log.push(Event::message("No foe to strike.".to_string()));
                 }
             }
-            Action::Song(song) => self.cast_song(song, &mut log),
+            Action::Song(song) => {
+                log.push(Event::BardBeat {
+                    track,
+                    note_idx,
+                    midi,
+                    zone,
+                });
+                self.cast_song(song, &mut log);
+            }
             Action::Soothe => {
+                log.push(Event::BardBeat {
+                    track,
+                    note_idx,
+                    midi,
+                    zone,
+                });
                 let gain = 22 + Self::soothe_bonus_for(&self.hero.companions);
                 let mut should_bind = false;
                 if let Some(m) = self.current.as_mut() {
@@ -796,6 +982,12 @@ impl Game {
                 }
             }
             Action::Summon(idx) => {
+                log.push(Event::BardBeat {
+                    track,
+                    note_idx,
+                    midi,
+                    zone,
+                });
                 if idx < self.hero.companions.len() {
                     let k = self.hero.companions[idx];
                     log.push(Event::message(format!(
@@ -1150,5 +1342,116 @@ mod tests {
             }
         }
         assert!(cleared_any);
+    }
+
+    #[test]
+    fn bard_thirds_split_test_track() {
+        // EMBER_VANGUARD_NOTES spans 57..=81 (span 24): thirds at 65 / 73.
+        assert_eq!(classify_bard_note(0, 57), BardZone::Low);
+        assert_eq!(classify_bard_note(0, 60), BardZone::Low);
+        assert_eq!(classify_bard_note(0, 69), BardZone::Mid);
+        assert_eq!(classify_bard_note(0, 72), BardZone::Mid);
+        assert_eq!(classify_bard_note(0, 79), BardZone::High);
+        assert_eq!(classify_bard_note(0, 81), BardZone::High);
+    }
+
+    #[test]
+    fn bard_note_at_wraps_and_steps() {
+        let dur = EMBER_VANGUARD_DUR;
+        let (i0, m0) = bard_note_at(0, 0.0);
+        assert_eq!((i0, m0), (0, 57));
+        let (i1, m1) = bard_note_at(0, dur * 1.0);
+        assert_eq!((i1, m1), (1, 60));
+        // Loop wraps after 16 steps.
+        let (iw, _) = bard_note_at(0, dur * 16.0);
+        assert_eq!(iw, 0);
+        // Negative clamps to start.
+        let (ineg, _) = bard_note_at(0, -5.0);
+        assert_eq!(ineg, 0);
+    }
+
+    #[test]
+    fn battle_track_selected_in_range() {
+        for seed in 0..20 {
+            let g = Game::new(seed);
+            assert!((g.battle_track as usize) < battle_track_count());
+        }
+    }
+
+    #[test]
+    fn strike_emits_bard_beat_with_explicit_clock() {
+        let mut g = Game::new(42);
+        g.current = Some(Monster::spawn(MonsterKind::Goblin));
+        g.battle_track = 0;
+        // t=0 -> note 57 -> Low.
+        let events = g.act_at(Action::Strike, Some(0.0));
+        let beat = events.iter().find_map(|e| match e {
+            Event::BardBeat { zone, midi, .. } => Some((*zone, *midi)),
+            _ => None,
+        });
+        assert_eq!(beat, Some((BardZone::Low, 57)));
+        // High cue lands on a high step (t = 10 * dur -> midi 81).
+        let mut g2 = Game::new(42);
+        g2.current = Some(Monster::spawn(MonsterKind::Goblin));
+        g2.battle_track = 0;
+        let t_high = EMBER_VANGUARD_DUR * 10.0;
+        let events = g2.act_at(Action::Strike, Some(t_high));
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::BardBeat {
+                zone: BardZone::High,
+                ..
+            }
+        )));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, Event::Sound(SoundTrigger::BardHigh))));
+    }
+
+    #[test]
+    fn bard_high_auto_hits_and_buffs() {
+        // Even with hit = 0.0, High still lands and deals >= 1.
+        let mut h = Hero::new();
+        h.hit = 0.0;
+        let mut m = Monster::spawn(MonsterKind::Goblin);
+        m.enraged = false;
+        let mut r = rng();
+        let dmg = h.strike(&mut m, &mut r, BardZone::High);
+        assert!(dmg >= 1, "high verse should auto-hit");
+    }
+
+    #[test]
+    fn bard_low_penalizes_and_can_miss() {
+        // Low lowers hit to 0.55 and shaves 2 damage; over many rolls we must
+        // see at least one miss and never exceed the unpenalized max.
+        let mut misses = 0;
+        let mut max_seen = 0;
+        for _ in 0..200 {
+            let mut h = Hero::new();
+            let mut m = Monster::spawn(MonsterKind::Goblin);
+            let mut r = rng();
+            let dmg = h.strike(&mut m, &mut r, BardZone::Low);
+            max_seen = max_seen.max(dmg);
+            if dmg == 0 {
+                misses += 1;
+            }
+        }
+        assert!(misses > 0, "low verse should miss sometimes");
+        // Base max 5 + crit 2 + verse 2 = 9; minus 2 => <= 7.
+        assert!(max_seen <= 7, "max {max_seen}");
+    }
+
+    #[test]
+    fn save_roundtrip_keeps_battle_track() {
+        let mut g = Game::new(1234);
+        g.battle_track = 0;
+        g.act_at(Action::Strike, Some(0.5));
+        let s = g.to_json();
+        let h = Game::from_json(&s).expect("roundtrip");
+        assert_eq!(h.battle_track, g.battle_track);
+        // Pre-bard saves (no battle_track key) still load as track 0.
+        let legacy = r#"{"hero":{"name":"Lantern-Bard","hp":15,"max_hp":15,"damage":5,"hit":0.8,"score":0,"turns":-1,"breath":6,"max_breath":6,"verse_power":0,"companions":[],"bestiary":[],"shards":0},"phase":"Combat","vault_index":0,"queue":[],"current":null,"fled":false,"seed":7,"rng":null}"#;
+        let old = Game::from_json(legacy).expect("legacy loads");
+        assert_eq!(old.battle_track, 0);
     }
 }
