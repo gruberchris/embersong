@@ -1070,10 +1070,10 @@ fn combat_setup(
         CombatScreen,
     ));
     // A fight starts: randomly selected track (picked in core) plays here.
-    // Long one-shot render (~8 loops); the music sink stops it on combat
-    // exit and restarts it when a kill/bind picks a new track mid-Combat.
+    // Single-loop render; the music sink repeats it gaplessly until combat
+    // exit or a kill/bind picks a new track mid-Combat.
     let track = session.game.battle_track;
-    let song = embersong_synth::render_battle_track(track, 8);
+    let song = embersong_synth::render_battle_track(track, 1);
     bus.play_music(song.samples, song.rate);
     clock.music_track = Some(track);
     push_log(
@@ -1395,10 +1395,12 @@ fn tick_combat_clock(
     clock.elapsed += time.delta_secs();
     clock.cooldown = (clock.cooldown - time.delta_secs()).max(0.0);
     // A kill/bind picks a new track for the next foe without leaving Combat:
-    // stop the stale loop and start the new fight's song.
+    // stop the stale loop and start the new fight's song (single loop; the
+    // sink repeats it). Future hook: rotate tracks here on a timer for a
+    // per-fight playlist or per-monster song table.
     if needs_music_restart(clock.music_track, session.game.battle_track) {
         let track = session.game.battle_track;
-        let song = embersong_synth::render_battle_track(track, 8);
+        let song = embersong_synth::render_battle_track(track, 1);
         bus.play_music(song.samples, song.rate);
         clock.music_track = Some(track);
     }

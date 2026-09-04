@@ -245,6 +245,15 @@ mod tests {
     }
 
     #[test]
+    fn battle_track_single_loop_is_compact() {
+        // The music sink repeats one loop gaplessly, so combat renders stay
+        // small (fast fight entry, tiny queue).
+        let s = render_battle_track(0, 1);
+        let secs = s.samples.len() as f32 / s.rate as f32;
+        assert!(secs > 1.0 && secs < 6.0, "{secs}s");
+    }
+
+    #[test]
     fn midi_to_freq_matches_a440() {
         assert!((midi_to_freq(69) - 440.0).abs() < 0.5);
         assert!(midi_to_freq(81) > midi_to_freq(57));

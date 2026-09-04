@@ -6,6 +6,7 @@
 use std::sync::mpsc::{self, Sender};
 
 use bevy::prelude::Resource;
+use rodio::Source as _;
 
 enum AudioCmd {
     Sfx(Vec<f32>, u32),
@@ -46,12 +47,16 @@ impl SoundBus {
                             sfx_sink.append(src);
                         }
                         AudioCmd::Music(samples, rate) => {
-                            // Stop-then-play: the stale track never lingers
+                            // Stop-then-loop: the stale track never lingers
                             // under the new one (death -> sing-again left the
-                            // old combat loop queued behind menu beds).
+                            // old combat loop queued behind menu beds), and
+                            // the new track repeats gaplessly until stopped
+                            // (combat exit or track change). Single-loop
+                            // renders only — the sink does the repeating.
                             music_sink.stop();
-                            let src = rodio::buffer::SamplesBuffer::new(1, rate, samples);
-                            music_sink.append(src);
+                            let looped = rodio::buffer::SamplesBuffer::new(1, rate, samples)
+                                .repeat_infinite();
+                            music_sink.append(looped);
                         }
                         AudioCmd::StopMusic => music_sink.stop(),
                         // Death/run-end: drop the mash backlog so queued
