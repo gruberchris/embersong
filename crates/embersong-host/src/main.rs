@@ -69,10 +69,18 @@ fn combat_glow_color(mode: LightingMode) -> Color {
     }
 }
 
-/// Wall-clock seconds since the current fight started (bard clock).
+/// Wall-clock seconds since the current fight started (bard clock),
+/// plus which battle track the music sink is currently playing.
 #[derive(Resource, Default)]
 struct CombatClock {
     elapsed: f32,
+    music_track: Option<u32>,
+}
+
+/// True when the sink holds a different track than the current fight
+/// (kill/bind starts a new fight mid-Combat): restart music.
+fn needs_music_restart(known: Option<u32>, current: u32) -> bool {
+    known != Some(current)
 }
 
 #[derive(Resource)]
@@ -556,7 +564,7 @@ fn begin_run(session: &mut Session, bus: &SoundBus, game: Game, next: &mut NextS
         "The lantern is lit. Hollow Hill waits.".to_string(),
     );
     let bed = embersong_synth::render_song_bed(2, false);
-    bus.play(bed.samples, bed.rate);
+    bus.play_music(bed.samples, bed.rate);
     next.set(AppState::Explore);
 }
 
@@ -882,12 +890,13 @@ fn combat_setup(
         Transform::from_xyz(0.0, 110.0, 4.0),
         CombatScreen,
     ));
-    // A fight starts: randomly selected track (picked in core) loops here.
-    // Long one-shot render (~8 loops) stands in for a true loop until the
-    // audio bus gains stop/crossfade support.
+    // A fight starts: randomly selected track (picked in core) plays here.
+    // Long one-shot render (~8 loops); the music sink stops it on combat
+    // exit and restarts it when a kill/bind picks a new track mid-Combat.
     let track = session.game.battle_track;
     let song = embersong_synth::render_battle_track(track, 8);
-    bus.play(song.samples, song.rate);
+    bus.play_music(song.samples, song.rate);
+    clock.music_track = Some(track);
     push_log(
         &mut session,
         format!(
@@ -1174,10 +1183,32 @@ fn combat_buttons(
     }
 }
 
-fn tick_combat_clock(time: Res<Time>, state: Res<State<AppState>>, mut clock: ResMut<CombatClock>) {
-    if *state.get() == AppState::Combat {
-        clock.elapsed += time.delta_secs();
+#[allow(clippy::too_many_arguments)] // Bevy systems take their params as args.
+fn tick_combat_clock(
+    time: Res<Time>,
+    state: Res<State<AppState>>,
+    mut clock: ResMut<CombatClock>,
+    session: Res<Session>,
+    bus: Res<SoundBus>,
+) {
+    if *state.get() != AppState::Combat {
+        return;
     }
+    clock.elapsed += time.delta_secs();
+    // A kill/bind picks a new track for the next foe without leaving Combat:
+    // stop the stale loop and start the new fight's song.
+    if needs_music_restart(clock.music_track, session.game.battle_track) {
+        let track = session.game.battle_track;
+        let song = embersong_synth::render_battle_track(track, 8);
+        bus.play_music(song.samples, song.rate);
+        clock.music_track = Some(track);
+    }
+}
+
+/// Leaving a fight silences its music; the next screen starts its own bed.
+/// (Without this the 8-loop combat render kept playing under menu beds.)
+fn stop_music_on_exit(bus: Res<SoundBus>) {
+    bus.stop_music();
 }
 
 fn bard_note_rise_fade(
@@ -1300,16 +1331,23 @@ fn main() {
     let kinds = kinds_or_current(&game);
     let map = GenMap::generate(seed, 0, &kinds);
 
+    // Note: Bevy's own audio plugin is disabled — all sound goes through
+    // SoundBus (its own rodio stream). Two output streams contended for the
+    // device and queued against each other.
     App::new()
         .insert_resource(ClearColor(Color::srgb(0.09, 0.08, 0.16)))
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "Embersong: Canticle of the Caged Stars".into(),
-                resolution: (1280.0_f32, 800.0_f32).into(),
-                ..default()
-            }),
-            ..default()
-        }))
+        .add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "Embersong: Canticle of the Caged Stars".into(),
+                        resolution: (1280.0_f32, 800.0_f32).into(),
+                        ..default()
+                    }),
+                    ..default()
+                })
+                .disable::<bevy::audio::AudioPlugin>(),
+        )
         .init_state::<AppState>()
         .insert_resource(Session {
             game,
@@ -1328,7 +1366,10 @@ fn main() {
         .add_systems(OnEnter(AppState::Explore), explore_setup)
         .add_systems(OnExit(AppState::Explore), despawn_all::<ExploreScreen>)
         .add_systems(OnEnter(AppState::Combat), combat_setup)
-        .add_systems(OnExit(AppState::Combat), despawn_all::<CombatScreen>)
+        .add_systems(
+            OnExit(AppState::Combat),
+            (despawn_all::<CombatScreen>, stop_music_on_exit),
+        )
         .add_systems(OnEnter(AppState::End), end_setup)
         .add_systems(OnExit(AppState::End), despawn_all::<EndScreen>)
         // One chain: total ordering silences cross-system borrow ambiguity.
@@ -1500,5 +1541,23 @@ mod host_tests {
         let s = test_session(7);
         let line = hero_line(&s.game);
         assert!(line.contains("Ember Vanguard March"), "{line}");
+    }
+
+    #[test]
+    fn music_restarts_only_on_track_change() {
+        // Fresh combat has nothing playing: first sighting records, no restart.
+        assert!(needs_music_restart(None, 0));
+        assert!(!needs_music_restart(Some(0), 0));
+        // Kill/bind picks a new track mid-Combat: restart.
+        // Single-track build today, but the helper must already handle it.
+        assert!(needs_music_restart(Some(1), 0));
+        assert!(!needs_music_restart(Some(0), 0));
+    }
+
+    #[test]
+    fn combat_clock_starts_with_no_music() {
+        let clock = CombatClock::default();
+        assert_eq!(clock.elapsed, 0.0);
+        assert_eq!(clock.music_track, None);
     }
 }
