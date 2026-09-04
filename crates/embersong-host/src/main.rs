@@ -86,8 +86,10 @@ fn needs_music_restart(known: Option<u32>, current: u32) -> bool {
 }
 
 /// Cooldown after an action so presses can't outrun the sounds they queued:
-/// the summed SFX length of the turn's events, clamped to a playable band.
-/// Pure helper (UI-only; never fed back into core, so replays stay identical).
+/// a beat behind the summed SFX length of the turn's events (0.6x keeps
+/// combat snappy while mashing still laps nothing badly), clamped to a
+/// playable band. Pure helper (UI-only; never fed back into core, so
+/// replays stay identical).
 fn action_cooldown(events: &[Event]) -> f32 {
     let total: f32 = events
         .iter()
@@ -96,7 +98,7 @@ fn action_cooldown(events: &[Event]) -> f32 {
             _ => None,
         })
         .sum();
-    total.clamp(0.3, 1.0)
+    (total * 0.6).clamp(0.15, 0.65)
 }
 
 #[derive(Resource)]
@@ -875,6 +877,22 @@ fn explore_hud(
 const BTN_NORMAL: Color = Color::srgb(0.28, 0.20, 0.42);
 const BTN_HOVER: Color = Color::srgb(0.45, 0.30, 0.62);
 const BTN_DOWN: Color = Color::srgb(0.60, 0.42, 0.75);
+/// Verse resolving: buttons read as disabled until the cooldown clears.
+const BTN_DISABLED: Color = Color::srgb(0.10, 0.09, 0.16);
+
+/// Single owner of button appearance: dimmed while the verse resolves,
+/// otherwise normal/hover/pressed. Pure helper so tests pin the mapping.
+fn combat_button_color(cooling: bool, interaction: &Interaction) -> Color {
+    if cooling {
+        BTN_DISABLED
+    } else {
+        match interaction {
+            Interaction::Pressed => BTN_DOWN,
+            Interaction::Hovered => BTN_HOVER,
+            Interaction::None => BTN_NORMAL,
+        }
+    }
+}
 
 fn combat_setup(
     mut commands: Commands,
@@ -1169,10 +1187,7 @@ fn combat_keys(
 #[allow(clippy::too_many_arguments)] // Bevy systems take their params as args.
 fn combat_buttons(
     mut commands: Commands,
-    mut q: Query<
-        (&Interaction, &mut BackgroundColor, &CombatBtn),
-        (Changed<Interaction>, With<Button>),
-    >,
+    mut q: Query<(&Interaction, &CombatBtn), (Changed<Interaction>, With<Button>)>,
     mut session: ResMut<Session>,
     backend: Res<BackendRes>,
     bus: Res<SoundBus>,
@@ -1181,40 +1196,46 @@ fn combat_buttons(
     foe_q: Query<&Transform, (With<CombatFoe>, Without<BardNote>)>,
     mut next: ResMut<NextState<AppState>>,
 ) {
-    for (interaction, mut color, btn) in &mut q {
-        match *interaction {
-            Interaction::Pressed => {
-                *color = BTN_DOWN.into();
-                // Button visuals still update while cooling, but the press
-                // is swallowed so mashing can't lap the audio queue.
-                if clock.cooldown > 0.0 {
-                    continue;
-                }
-                let action = match btn.0 {
-                    BtnKind::Strike => Action::Strike,
-                    BtnKind::Song => Action::Song(SONGS[session.song_idx]),
-                    BtnKind::Soothe => Action::Soothe,
-                    BtnKind::Heal => Action::Heal,
-                    BtnKind::Summon => Action::Summon(0),
-                    BtnKind::Flee => Action::Flee,
-                };
-                let beat = Some(clock.elapsed);
-                let events = do_hero_action(&mut session, &backend, &bus, action, beat, &mut next);
-                clock.cooldown = action_cooldown(&events);
-                let foe_pos = foe_q
-                    .iter()
-                    .next()
-                    .map(|t| t.translation)
-                    .unwrap_or(Vec3::new(0.0, 110.0, 5.0));
-                for e in events {
-                    if let Event::BardBeat { zone, .. } = e {
-                        spawn_bard_note(&mut commands, &sprites, zone, foe_pos);
-                    }
-                }
-            }
-            Interaction::Hovered => *color = BTN_HOVER.into(),
-            Interaction::None => *color = BTN_NORMAL.into(),
+    for (interaction, btn) in &mut q {
+        // Appearance is owned by combat_button_tint (runs every frame);
+        // this system only dispatches. Presses while cooling are swallowed
+        // so mashing can't lap the audio queue.
+        if *interaction != Interaction::Pressed || clock.cooldown > 0.0 {
+            continue;
         }
+        let action = match btn.0 {
+            BtnKind::Strike => Action::Strike,
+            BtnKind::Song => Action::Song(SONGS[session.song_idx]),
+            BtnKind::Soothe => Action::Soothe,
+            BtnKind::Heal => Action::Heal,
+            BtnKind::Summon => Action::Summon(0),
+            BtnKind::Flee => Action::Flee,
+        };
+        let beat = Some(clock.elapsed);
+        let events = do_hero_action(&mut session, &backend, &bus, action, beat, &mut next);
+        clock.cooldown = action_cooldown(&events);
+        let foe_pos = foe_q
+            .iter()
+            .next()
+            .map(|t| t.translation)
+            .unwrap_or(Vec3::new(0.0, 110.0, 5.0));
+        for e in events {
+            if let Event::BardBeat { zone, .. } = e {
+                spawn_bard_note(&mut commands, &sprites, zone, foe_pos);
+            }
+        }
+    }
+}
+
+/// Repaints every combat button each frame: dimmed while the verse
+/// resolves, normal/hover/pressed otherwise.
+fn combat_button_tint(
+    clock: Res<CombatClock>,
+    mut q: Query<(&Interaction, &mut BackgroundColor), With<CombatBtn>>,
+) {
+    let cooling = clock.cooldown > 0.0;
+    for (interaction, mut color) in &mut q {
+        *color = combat_button_color(cooling, interaction).into();
     }
 }
 
@@ -1434,6 +1455,7 @@ fn main() {
                 tick_combat_clock,
                 combat_keys.run_if(in_state(AppState::Combat)),
                 combat_buttons.run_if(in_state(AppState::Combat)),
+                combat_button_tint.run_if(in_state(AppState::Combat)),
                 combat_hud.run_if(in_state(AppState::Combat)),
                 foe_pulse.run_if(in_state(AppState::Combat)),
                 bard_note_rise_fade,
@@ -1617,26 +1639,45 @@ mod host_tests {
     fn action_cooldown_tracks_sound_but_stays_playable() {
         use embersong_core::SoundTrigger;
         // Silence still costs the floor, so machine-gunning is impossible.
-        assert_eq!(action_cooldown(&[]), 0.3);
+        assert_eq!(action_cooldown(&[]), 0.15);
         // A lone miss blip floors too.
         let miss = vec![Event::Sound(SoundTrigger::Miss)];
-        assert_eq!(action_cooldown(&miss), 0.3);
-        // A typical strike turn paces to its sounds.
+        assert_eq!(action_cooldown(&miss), 0.15);
+        // A typical strike turn trails its sounds at 0.6x: snappy, not lapping.
         let turn = vec![
             Event::Sound(SoundTrigger::Strike),
             Event::Sound(SoundTrigger::HeroHurt),
         ];
         let cd = action_cooldown(&turn);
-        assert!(cd > 0.3 && cd < 1.0, "{cd}");
+        assert!(cd > 0.15 && cd < 0.65, "{cd}");
         // A huge turn (kill + victory sting) caps instead of freezing input.
         let big = vec![
             Event::Sound(SoundTrigger::Strike),
             Event::Sound(SoundTrigger::MonsterDie),
             Event::Sound(SoundTrigger::Victory),
         ];
-        assert_eq!(action_cooldown(&big), 1.0);
+        assert_eq!(action_cooldown(&big), 0.65);
         // Non-sound events don't extend the wait.
         let chat = vec![Event::Message("hi".into())];
-        assert_eq!(action_cooldown(&chat), 0.3);
+        assert_eq!(action_cooldown(&chat), 0.15);
+    }
+
+    #[test]
+    fn buttons_dim_while_cooling_then_restore() {
+        use Interaction::{Hovered, None, Pressed};
+        // Cooling beats every interaction state.
+        for i in [None, Hovered, Pressed] {
+            assert_eq!(combat_button_color(true, &i), BTN_DISABLED);
+        }
+        // Ready restores the familiar mapping.
+        assert_eq!(combat_button_color(false, &None), BTN_NORMAL);
+        assert_eq!(combat_button_color(false, &Hovered), BTN_HOVER);
+        assert_eq!(combat_button_color(false, &Pressed), BTN_DOWN);
+        // Disabled is visibly darker than every live state.
+        let d = BTN_DISABLED.to_srgba();
+        for live in [BTN_NORMAL, BTN_HOVER, BTN_DOWN] {
+            let l = live.to_srgba();
+            assert!(d.red < l.red && d.green < l.green && d.blue < l.blue);
+        }
     }
 }
