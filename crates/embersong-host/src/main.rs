@@ -10,7 +10,7 @@ mod sprites;
 use audio::SoundBus;
 use backend::Backend;
 use bevy::prelude::*;
-use embersong_core::{Action, Event, Game, MonsterKind, Phase, Song};
+use embersong_core::{Action, BardZone, Event, Game, MonsterKind, Phase, Song};
 use sprites::{build_sprites, SpriteSet};
 use std::sync::Mutex;
 
@@ -38,6 +38,69 @@ enum AppState {
 #[derive(Resource)]
 struct BackendRes(Mutex<Backend>);
 
+/// Combat lighting preset per encounter. Dungeon stays moody but lifted;
+/// Outdoor is brighter/warmer. Vaults map to a mode so future encounters
+/// can pick palettes without refactoring combat rendering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LightingMode {
+    Dungeon,
+    Outdoor,
+}
+
+fn lighting_for_vault(vault_index: usize) -> LightingMode {
+    match vault_index {
+        1 => LightingMode::Outdoor,
+        _ => LightingMode::Dungeon,
+    }
+}
+
+fn combat_backdrop(mode: LightingMode) -> Color {
+    match mode {
+        // Lifted from near-black: readable HUD + foe silhouette.
+        LightingMode::Dungeon => Color::srgba(0.10, 0.08, 0.20, 0.55),
+        LightingMode::Outdoor => Color::srgba(0.16, 0.14, 0.24, 0.45),
+    }
+}
+
+fn combat_glow_color(mode: LightingMode) -> Color {
+    match mode {
+        LightingMode::Dungeon => Color::srgba(1.0, 0.75, 0.4, 0.55),
+        LightingMode::Outdoor => Color::srgba(1.0, 0.9, 0.6, 0.65),
+    }
+}
+
+/// Wall-clock seconds since the current fight started (bard clock),
+/// which battle track the music sink is playing, and the input cooldown
+/// until the next action may fire (it paces presses to the sounds they made).
+#[derive(Resource, Default)]
+struct CombatClock {
+    elapsed: f32,
+    music_track: Option<u32>,
+    cooldown: f32,
+}
+
+/// True when the sink holds a different track than the current fight
+/// (kill/bind starts a new fight mid-Combat): restart music.
+fn needs_music_restart(known: Option<u32>, current: u32) -> bool {
+    known != Some(current)
+}
+
+/// Cooldown after an action so presses can't outrun the sounds they queued:
+/// a beat behind the summed SFX length of the turn's events (0.6x keeps
+/// combat snappy while mashing still laps nothing badly), clamped to a
+/// playable band. Pure helper (UI-only; never fed back into core, so
+/// replays stay identical).
+fn action_cooldown(events: &[Event]) -> f32 {
+    let total: f32 = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Sound(t) => Some(embersong_synth::sfx_duration(*t)),
+            _ => None,
+        })
+        .sum();
+    (total * 0.6).clamp(0.15, 0.65)
+}
+
 #[derive(Resource)]
 struct Session {
     game: Game,
@@ -45,6 +108,27 @@ struct Session {
     player: IVec2,
     map: GenMap,
     song_idx: usize,
+    last_bard: Option<(BardZone, u8)>,
+}
+
+/// Pause modal on the overworld (Explore only).
+#[derive(Resource, Default)]
+struct PauseMenu {
+    open: bool,
+}
+
+#[derive(Component)]
+struct PauseMenuUI;
+
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+enum PauseBtn {
+    Resume,
+    Quit,
+}
+
+/// Pure gate: no overworld input while the modal is up.
+fn explore_blocked(paused: &PauseMenu) -> bool {
+    paused.open
 }
 
 #[derive(Clone)]
@@ -136,6 +220,13 @@ struct Ember {
 #[derive(Component)]
 struct CombatBtn(BtnKind);
 
+/// Floating bard-note feedback: rises and fades over ~1.1s.
+#[derive(Component)]
+struct BardNote {
+    life: f32,
+    max: f32,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BtnKind {
     Strike,
@@ -201,9 +292,9 @@ fn headless(seed: u64, turns: u32, native: bool) -> i32 {
         } else {
             Action::Strike
         };
-        let events = backend.act(&mut game, act);
+        let events = backend.act(&mut game, act, None);
         if let (Some(wb), Some(wg)) = (wasm_backend.as_mut(), wasm_game.as_mut()) {
-            let w_events = wb.act(wg, act);
+            let w_events = wb.act(wg, act, None);
             let (j1, j2) = (game.to_json(), wg.to_json());
             if j1 != j2 {
                 eprintln!("DIVERGENCE at turn {played} action {act:?}");
@@ -272,11 +363,32 @@ fn push_log(session: &mut Session, line: String) {
     }
 }
 
+fn bard_log_line(zone: BardZone, midi: u8) -> String {
+    match zone {
+        BardZone::High => format!("♪ high verse rings (note {midi})! +50%, true strike!"),
+        BardZone::Low => format!("♭ low verse falters (note {midi})... -2, shaky aim."),
+        BardZone::Mid => format!("♫ steady verse (note {midi})."),
+    }
+}
+
 fn apply_events(session: &mut Session, bus: &SoundBus, events: Vec<Event>) {
     for e in events {
         match e {
             Event::Message(m) => push_log(session, m),
             Event::Sound(t) => bus.play_trigger(t),
+            Event::BardBeat {
+                track: _,
+                note_idx: _,
+                midi,
+                zone,
+            } => {
+                session.last_bard = Some((zone, midi));
+                // Only narrate the extremes in the log; steady verses would spam.
+                match zone {
+                    BardZone::High | BardZone::Low => push_log(session, bard_log_line(zone, midi)),
+                    BardZone::Mid => {}
+                }
+            }
             Event::Tamed(k) => push_log(
                 session,
                 format!("{} glows in your Bestiary.", k.display_name()),
@@ -299,7 +411,7 @@ fn save_game(game: &Game) {
 fn hero_line(game: &Game) -> String {
     let vault = &Game::vaults()[game.vault_index];
     format!(
-        "HP {}/{}   Breath {}/{}   Binds {}   Shards {}   Companions {}   Bestiary {}/12\n{} (vault {}/{})",
+        "HP {}/{}   Breath {}/{}   Binds {}   Shards {}   Companions {}   Bestiary {}/12\n{} (vault {}/{})\n♪ {}",
         game.hero.hp,
         game.hero.max_hp,
         game.hero.breath,
@@ -310,7 +422,8 @@ fn hero_line(game: &Game) -> String {
         game.hero.bestiary.len(),
         vault.name,
         game.vault_index + 1,
-        Game::vaults().len()
+        Game::vaults().len(),
+        embersong_core::battle_track_name(game.battle_track),
     )
 }
 
@@ -340,23 +453,49 @@ fn song_name(session: &Session) -> &'static str {
     SONGS[session.song_idx].name()
 }
 
-/// Run one hero turn through the backend; true when the run ended.
+/// Run one hero turn through the backend; returns events for bard-note spawn.
 fn do_hero_action(
     session: &mut Session,
     backend: &BackendRes,
     bus: &SoundBus,
     action: Action,
+    beat_time: Option<f32>,
     next: &mut NextState<AppState>,
-) {
+) -> Vec<Event> {
     let mut backend = backend.0.lock().unwrap();
-    let events = backend.act(&mut session.game, action);
+    let events = backend.act(&mut session.game, action, beat_time);
     drop(backend);
+    let out = events.clone();
     apply_events(session, bus, events);
     save_game(&session.game);
     if matches!(session.game.phase, Phase::GameOver | Phase::Victory) {
         let _ = std::fs::remove_file(SAVE_PATH);
         next.set(AppState::End);
     }
+    out
+}
+
+fn spawn_bard_note(commands: &mut Commands, sprites: &SpriteSet, zone: BardZone, foe_pos: Vec3) {
+    // Extremes get sprites; steady verses stay quiet to avoid spam.
+    let bright = match zone {
+        BardZone::High => true,
+        BardZone::Low => false,
+        BardZone::Mid => return,
+    };
+    let offset = if bright { 70.0 } else { -70.0 };
+    commands.spawn((
+        Sprite {
+            image: sprites.bard_note(bright),
+            custom_size: Some(Vec2::new(36.0, 42.0)),
+            ..default()
+        },
+        Transform::from_xyz(foe_pos.x + offset, foe_pos.y + 40.0, 20.0),
+        CombatScreen,
+        BardNote {
+            life: 0.0,
+            max: 1.1,
+        },
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -454,6 +593,7 @@ fn title_setup(mut commands: Commands, asset_server: Res<AssetServer>) {
 fn begin_run(session: &mut Session, bus: &SoundBus, game: Game, next: &mut NextState<AppState>) {
     session.game = game;
     session.log.clear();
+    session.last_bard = None;
     session.player = IVec2::new(MAP_W / 2, MAP_H / 2);
     let kinds = kinds_or_current(&session.game);
     session.map = GenMap::generate(session.game.seed, session.game.vault_index, &kinds);
@@ -462,7 +602,9 @@ fn begin_run(session: &mut Session, bus: &SoundBus, game: Game, next: &mut NextS
         "The lantern is lit. Hollow Hill waits.".to_string(),
     );
     let bed = embersong_synth::render_song_bed(2, false);
-    bus.play(bed.samples, bed.rate);
+    // Cut any lingering sting (e.g. mashing R through the End screen).
+    bus.stop_sfx();
+    bus.play_music(bed.samples, bed.rate);
     next.set(AppState::Explore);
 }
 
@@ -651,8 +793,125 @@ fn explore_setup(
             ExploreScreen,
         ))
         .with_children(|p| {
-            p.spawn((Text::new("WASD move · E seek foe · R rest"), f_help, c_help));
+            p.spawn((
+                Text::new("WASD move · E seek foe · R rest · ESC menu"),
+                f_help,
+                c_help,
+            ));
         });
+}
+
+/// Centered pause modal: dim veil + panel with Resume / Quit Game.
+fn spawn_pause_menu(commands: &mut Commands, asset_server: &AssetServer) {
+    commands
+        .spawn((
+            Node {
+                width: Val::Percent(100.0),
+                height: Val::Percent(100.0),
+                justify_content: JustifyContent::Center,
+                align_items: AlignItems::Center,
+                ..default()
+            },
+            BackgroundColor(Color::srgba(0.02, 0.02, 0.05, 0.72)),
+            ExploreScreen,
+            PauseMenuUI,
+        ))
+        .with_children(|veil| {
+            veil.spawn((
+                Node {
+                    width: Val::Px(320.0),
+                    height: Val::Px(300.0),
+                    flex_direction: FlexDirection::Column,
+                    justify_content: JustifyContent::Center,
+                    align_items: AlignItems::Center,
+                    row_gap: Val::Px(12.0),
+                    ..default()
+                },
+                BackgroundColor(Color::srgb(0.16, 0.12, 0.26)),
+            ))
+            .with_children(|panel| {
+                let (f_title, c_title) = font(asset_server, 28.0, Color::srgb(1.0, 0.88, 0.6));
+                panel.spawn((Text::new("PAUSED"), f_title, c_title));
+                for (kind, label) in [(PauseBtn::Resume, "Resume"), (PauseBtn::Quit, "Quit Game")] {
+                    let (f, c) = font(asset_server, 18.0, Color::WHITE);
+                    panel
+                        .spawn((
+                            Button,
+                            kind,
+                            Node {
+                                width: Val::Px(220.0),
+                                height: Val::Px(52.0),
+                                justify_content: JustifyContent::Center,
+                                align_items: AlignItems::Center,
+                                ..default()
+                            },
+                            BackgroundColor(BTN_NORMAL),
+                        ))
+                        .with_children(|b| {
+                            b.spawn((Text::new(label), f, c));
+                        });
+                }
+                let (f_hint, c_hint) = font(asset_server, 14.0, Color::srgb(0.7, 0.68, 0.8));
+                panel.spawn((Text::new("ESC resume · Q quit"), f_hint, c_hint));
+            });
+        });
+}
+
+fn pause_toggle(
+    mut commands: Commands,
+    keys: Res<ButtonInput<KeyCode>>,
+    asset_server: Res<AssetServer>,
+    mut paused: ResMut<PauseMenu>,
+    session: Res<Session>,
+    menu_q: Query<Entity, With<PauseMenuUI>>,
+) {
+    if keys.just_pressed(KeyCode::Escape) {
+        paused.open = !paused.open;
+        if paused.open {
+            spawn_pause_menu(&mut commands, &asset_server);
+        } else {
+            for e in &menu_q {
+                commands.entity(e).despawn_recursive();
+            }
+        }
+    } else if paused.open && keys.just_pressed(KeyCode::KeyQ) {
+        save_game(&session.game);
+        std::process::exit(0);
+    }
+}
+
+#[allow(clippy::type_complexity)] // Bevy button-interaction query.
+fn pause_buttons(
+    mut commands: Commands,
+    mut q: Query<
+        (&Interaction, &mut BackgroundColor, &PauseBtn),
+        (Changed<Interaction>, With<Button>),
+    >,
+    mut paused: ResMut<PauseMenu>,
+    session: Res<Session>,
+    menu_q: Query<Entity, With<PauseMenuUI>>,
+) {
+    for (interaction, mut color, btn) in &mut q {
+        match *interaction {
+            Interaction::Pressed => {
+                *color = BTN_DOWN.into();
+                match btn {
+                    PauseBtn::Resume => {
+                        paused.open = false;
+                        for e in &menu_q {
+                            commands.entity(e).despawn_recursive();
+                        }
+                    }
+                    PauseBtn::Quit => {
+                        save_game(&session.game);
+                        std::process::exit(0);
+                    }
+                }
+            }
+            Interaction::Hovered => *color = BTN_HOVER.into(),
+            Interaction::None => *color = BTN_NORMAL.into(),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // Bevy systems take their params as args.
@@ -666,7 +925,12 @@ fn explore_move(
     mut player_q: Query<&mut Transform, (With<PlayerToken>, Without<PlayerGlow>)>,
     mut glow_q: Query<&mut Transform, (With<PlayerGlow>, Without<PlayerToken>)>,
     sprites: Res<SpriteSet>,
+    paused: Res<PauseMenu>,
 ) {
+    // Modal up: freeze overworld input (ESC/Q still handled by pause systems).
+    if explore_blocked(&paused) {
+        return;
+    }
     // The core auto-advanced to the next vault after a clear: rebuild the map.
     if session.map.vault != session.game.vault_index {
         for e in &tiles {
@@ -709,8 +973,6 @@ fn explore_move(
     }
     if keys.just_pressed(KeyCode::KeyE) || keys.just_pressed(KeyCode::Space) {
         if session.game.current.is_some() {
-            let bed = embersong_synth::render_song_bed(1, true);
-            bus.play(bed.samples, bed.rate);
             next.set(AppState::Combat);
         } else {
             push_log(&mut session, "Only embers drift here.".to_string());
@@ -754,26 +1016,73 @@ fn explore_hud(
 // Combat
 // ---------------------------------------------------------------------------
 
-const BTN_NORMAL: Color = Color::srgb(0.20, 0.14, 0.32);
-const BTN_HOVER: Color = Color::srgb(0.35, 0.22, 0.50);
-const BTN_DOWN: Color = Color::srgb(0.50, 0.32, 0.65);
+const BTN_NORMAL: Color = Color::srgb(0.28, 0.20, 0.42);
+const BTN_HOVER: Color = Color::srgb(0.45, 0.30, 0.62);
+const BTN_DOWN: Color = Color::srgb(0.60, 0.42, 0.75);
+/// Verse resolving: buttons read as disabled until the cooldown clears.
+const BTN_DISABLED: Color = Color::srgb(0.10, 0.09, 0.16);
+
+/// Single owner of button appearance: dimmed while the verse resolves,
+/// otherwise normal/hover/pressed. Pure helper so tests pin the mapping.
+fn combat_button_color(cooling: bool, interaction: &Interaction) -> Color {
+    if cooling {
+        BTN_DISABLED
+    } else {
+        match interaction {
+            Interaction::Pressed => BTN_DOWN,
+            Interaction::Hovered => BTN_HOVER,
+            Interaction::None => BTN_NORMAL,
+        }
+    }
+}
 
 fn combat_setup(
     mut commands: Commands,
     asset_server: Res<AssetServer>,
-    session: Res<Session>,
+    mut session: ResMut<Session>,
     sprites: Res<SpriteSet>,
+    bus: Res<SoundBus>,
+    mut clock: ResMut<CombatClock>,
 ) {
-    // Dim full-screen backdrop (spawned first so it sits behind everything).
+    clock.elapsed = 0.0;
+    clock.cooldown = 0.0;
+    session.last_bard = None;
+    let mode = lighting_for_vault(session.game.vault_index);
+    // Brightened full-screen backdrop (spawned first so it sits behind).
     commands.spawn((
         Node {
             width: Val::Percent(100.0),
             height: Val::Percent(100.0),
             ..default()
         },
-        BackgroundColor(Color::srgba(0.02, 0.01, 0.06, 0.88)),
+        BackgroundColor(combat_backdrop(mode)),
         CombatScreen,
     ));
+    // Warm glow behind the foe so it pops against the backdrop.
+    commands.spawn((
+        Sprite {
+            image: sprites.glow.clone(),
+            color: combat_glow_color(mode),
+            custom_size: Some(Vec2::new(420.0, 420.0)),
+            ..default()
+        },
+        Transform::from_xyz(0.0, 110.0, 4.0),
+        CombatScreen,
+    ));
+    // A fight starts: randomly selected track (picked in core) plays here.
+    // Single-loop render; the music sink repeats it gaplessly until combat
+    // exit or a kill/bind picks a new track mid-Combat.
+    let track = session.game.battle_track;
+    let song = embersong_synth::render_battle_track(track, 1);
+    bus.play_music(song.samples, song.rate);
+    clock.music_track = Some(track);
+    push_log(
+        &mut session,
+        format!(
+            "♪ {} strikes up! ♪",
+            embersong_core::battle_track_name(track)
+        ),
+    );
     // The foe, large and centered in world space.
     let foe_tex = session
         .game
@@ -868,8 +1177,8 @@ fn combat_setup(
                 });
             }
         });
-    let (f_main, c_main) = font(&asset_server, 18.0, Color::srgb(0.93, 0.9, 0.96));
-    let (f_log, c_log) = font(&asset_server, 16.0, Color::srgb(0.78, 0.74, 0.88));
+    let (f_main, c_main) = font(&asset_server, 18.0, Color::srgb(1.0, 1.0, 1.0));
+    let (f_log, c_log) = font(&asset_server, 16.0, Color::srgb(0.88, 0.86, 0.95));
     commands
         .spawn((
             Node {
@@ -905,6 +1214,7 @@ fn combat_setup(
 fn combat_hud(
     session: Res<Session>,
     sprites: Res<SpriteSet>,
+    clock: Res<CombatClock>,
     mut hud: Query<
         &mut Text,
         (
@@ -920,7 +1230,10 @@ fn combat_hud(
     mut foe: Query<&mut Sprite, With<CombatFoe>>,
     mut last_kind: Local<Option<MonsterKind>>,
 ) {
-    let body = format!("{}\n{}", hero_line(&session.game), foe_line(&session.game));
+    let mut body = format!("{}\n{}", hero_line(&session.game), foe_line(&session.game));
+    if clock.cooldown > 0.0 {
+        body.push_str("\n♪ verse resolving…");
+    }
     for mut t in &mut hud {
         t.0 = body.clone();
     }
@@ -960,11 +1273,16 @@ fn combat_hud(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Bevy systems take their params as args.
 fn combat_keys(
+    mut commands: Commands,
     keys: Res<ButtonInput<KeyCode>>,
     mut session: ResMut<Session>,
     backend: Res<BackendRes>,
     bus: Res<SoundBus>,
+    sprites: Res<SpriteSet>,
+    mut clock: ResMut<CombatClock>,
+    foe_q: Query<&Transform, With<CombatFoe>>,
     mut next: ResMut<NextState<AppState>>,
 ) {
     let mut act = None;
@@ -985,38 +1303,129 @@ fn combat_keys(
         let verse = song_name(&session);
         push_log(&mut session, format!("Verse ready: {verse}"));
     }
+    // Verse resolving: ignore action presses until the last turn's sounds
+    // have had room to play, so mashing can't lap the audio queue.
+    if clock.cooldown > 0.0 {
+        return;
+    }
     if let Some(action) = act {
-        do_hero_action(&mut session, &backend, &bus, action, &mut next);
+        let beat = Some(clock.elapsed);
+        let events = do_hero_action(&mut session, &backend, &bus, action, beat, &mut next);
+        clock.cooldown = action_cooldown(&events);
+        let foe_pos = foe_q
+            .iter()
+            .next()
+            .map(|t| t.translation)
+            .unwrap_or(Vec3::new(0.0, 110.0, 5.0));
+        for e in events {
+            if let Event::BardBeat { zone, .. } = e {
+                spawn_bard_note(&mut commands, &sprites, zone, foe_pos);
+            }
+        }
     }
 }
 
 #[allow(clippy::type_complexity)] // Bevy button-interaction query.
+#[allow(clippy::too_many_arguments)] // Bevy systems take their params as args.
 fn combat_buttons(
-    mut q: Query<
-        (&Interaction, &mut BackgroundColor, &CombatBtn),
-        (Changed<Interaction>, With<Button>),
-    >,
+    mut commands: Commands,
+    mut q: Query<(&Interaction, &CombatBtn), (Changed<Interaction>, With<Button>)>,
     mut session: ResMut<Session>,
     backend: Res<BackendRes>,
     bus: Res<SoundBus>,
+    sprites: Res<SpriteSet>,
+    mut clock: ResMut<CombatClock>,
+    foe_q: Query<&Transform, (With<CombatFoe>, Without<BardNote>)>,
     mut next: ResMut<NextState<AppState>>,
 ) {
-    for (interaction, mut color, btn) in &mut q {
-        match *interaction {
-            Interaction::Pressed => {
-                *color = BTN_DOWN.into();
-                let action = match btn.0 {
-                    BtnKind::Strike => Action::Strike,
-                    BtnKind::Song => Action::Song(SONGS[session.song_idx]),
-                    BtnKind::Soothe => Action::Soothe,
-                    BtnKind::Heal => Action::Heal,
-                    BtnKind::Summon => Action::Summon(0),
-                    BtnKind::Flee => Action::Flee,
-                };
-                do_hero_action(&mut session, &backend, &bus, action, &mut next);
+    for (interaction, btn) in &mut q {
+        // Appearance is owned by combat_button_tint (runs every frame);
+        // this system only dispatches. Presses while cooling are swallowed
+        // so mashing can't lap the audio queue.
+        if *interaction != Interaction::Pressed || clock.cooldown > 0.0 {
+            continue;
+        }
+        let action = match btn.0 {
+            BtnKind::Strike => Action::Strike,
+            BtnKind::Song => Action::Song(SONGS[session.song_idx]),
+            BtnKind::Soothe => Action::Soothe,
+            BtnKind::Heal => Action::Heal,
+            BtnKind::Summon => Action::Summon(0),
+            BtnKind::Flee => Action::Flee,
+        };
+        let beat = Some(clock.elapsed);
+        let events = do_hero_action(&mut session, &backend, &bus, action, beat, &mut next);
+        clock.cooldown = action_cooldown(&events);
+        let foe_pos = foe_q
+            .iter()
+            .next()
+            .map(|t| t.translation)
+            .unwrap_or(Vec3::new(0.0, 110.0, 5.0));
+        for e in events {
+            if let Event::BardBeat { zone, .. } = e {
+                spawn_bard_note(&mut commands, &sprites, zone, foe_pos);
             }
-            Interaction::Hovered => *color = BTN_HOVER.into(),
-            Interaction::None => *color = BTN_NORMAL.into(),
+        }
+    }
+}
+
+/// Repaints every combat button each frame: dimmed while the verse
+/// resolves, normal/hover/pressed otherwise.
+fn combat_button_tint(
+    clock: Res<CombatClock>,
+    mut q: Query<(&Interaction, &mut BackgroundColor), With<CombatBtn>>,
+) {
+    let cooling = clock.cooldown > 0.0;
+    for (interaction, mut color) in &mut q {
+        *color = combat_button_color(cooling, interaction).into();
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Bevy systems take their params as args.
+fn tick_combat_clock(
+    time: Res<Time>,
+    state: Res<State<AppState>>,
+    mut clock: ResMut<CombatClock>,
+    session: Res<Session>,
+    bus: Res<SoundBus>,
+) {
+    if *state.get() != AppState::Combat {
+        return;
+    }
+    clock.elapsed += time.delta_secs();
+    clock.cooldown = (clock.cooldown - time.delta_secs()).max(0.0);
+    // A kill/bind picks a new track for the next foe without leaving Combat:
+    // stop the stale loop and start the new fight's song (single loop; the
+    // sink repeats it). Future hook: rotate tracks here on a timer for a
+    // per-fight playlist or per-monster song table.
+    if needs_music_restart(clock.music_track, session.game.battle_track) {
+        let track = session.game.battle_track;
+        let song = embersong_synth::render_battle_track(track, 1);
+        bus.play_music(song.samples, song.rate);
+        clock.music_track = Some(track);
+    }
+}
+
+/// Leaving a fight silences it: music stops (the next screen starts its own
+/// bed) and queued SFX are dropped so mash backlog can't chase into End.
+/// (Without this the 8-loop combat render kept playing under menu beds.)
+fn stop_audio_on_exit(bus: Res<SoundBus>) {
+    bus.stop_music();
+    bus.stop_sfx();
+}
+
+fn bard_note_rise_fade(
+    mut commands: Commands,
+    time: Res<Time>,
+    mut q: Query<(Entity, &mut Transform, &mut Sprite, &mut BardNote)>,
+) {
+    for (e, mut t, mut s, mut n) in &mut q {
+        n.life += time.delta_secs();
+        t.translation.y += 60.0 * time.delta_secs();
+        let k = (n.life / n.max).clamp(0.0, 1.0);
+        s.color.set_alpha(1.0 - k);
+        if n.life >= n.max {
+            commands.entity(e).despawn_recursive();
         }
     }
 }
@@ -1032,7 +1441,20 @@ fn foe_pulse(time: Res<Time>, mut q: Query<&mut Transform, With<CombatFoe>>) {
 // End
 // ---------------------------------------------------------------------------
 
-fn end_setup(mut commands: Commands, asset_server: Res<AssetServer>, session: Res<Session>) {
+fn end_setup(
+    mut commands: Commands,
+    asset_server: Res<AssetServer>,
+    session: Res<Session>,
+    bus: Res<SoundBus>,
+) {
+    // The exit stop above wiped the final turn's blows too: replay exactly
+    // one clean sting for the outcome.
+    bus.stop_sfx();
+    match session.game.phase {
+        Phase::Victory => bus.play_trigger(embersong_core::SoundTrigger::Victory),
+        _ if session.game.hero.hp <= 0 => bus.play_trigger(embersong_core::SoundTrigger::Defeat),
+        _ => {}
+    }
     let (title, color) = match session.game.phase {
         Phase::Victory => ("✦ ALL VAULTS SING ✦", Color::srgb(1.0, 0.9, 0.55)),
         _ if session.game.hero.hp <= 0 => ("THE LANTERN GUTTERS OUT", Color::srgb(0.9, 0.4, 0.4)),
@@ -1125,16 +1547,23 @@ fn main() {
     let kinds = kinds_or_current(&game);
     let map = GenMap::generate(seed, 0, &kinds);
 
+    // Note: Bevy's own audio plugin is disabled — all sound goes through
+    // SoundBus (its own rodio stream). Two output streams contended for the
+    // device and queued against each other.
     App::new()
-        .insert_resource(ClearColor(Color::srgb(0.03, 0.02, 0.08)))
-        .add_plugins(DefaultPlugins.set(WindowPlugin {
-            primary_window: Some(Window {
-                title: "Embersong: Canticle of the Caged Stars".into(),
-                resolution: (1280.0_f32, 800.0_f32).into(),
-                ..default()
-            }),
-            ..default()
-        }))
+        .insert_resource(ClearColor(Color::srgb(0.09, 0.08, 0.16)))
+        .add_plugins(
+            DefaultPlugins
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        title: "Embersong: Canticle of the Caged Stars".into(),
+                        resolution: (1280.0_f32, 800.0_f32).into(),
+                        ..default()
+                    }),
+                    ..default()
+                })
+                .disable::<bevy::audio::AudioPlugin>(),
+        )
         .init_state::<AppState>()
         .insert_resource(Session {
             game,
@@ -1142,16 +1571,22 @@ fn main() {
             player: IVec2::new(MAP_W / 2, MAP_H / 2),
             map,
             song_idx: 1,
+            last_bard: None,
         })
         .insert_resource(BackendRes(Mutex::new(backend)))
         .insert_resource(SoundBus::spawn())
+        .insert_resource(CombatClock::default())
+        .insert_resource(PauseMenu::default())
         .add_systems(Startup, (setup_once, build_sprites))
         .add_systems(OnEnter(AppState::Title), title_setup)
         .add_systems(OnExit(AppState::Title), despawn_all::<TitleScreen>)
         .add_systems(OnEnter(AppState::Explore), explore_setup)
         .add_systems(OnExit(AppState::Explore), despawn_all::<ExploreScreen>)
         .add_systems(OnEnter(AppState::Combat), combat_setup)
-        .add_systems(OnExit(AppState::Combat), despawn_all::<CombatScreen>)
+        .add_systems(
+            OnExit(AppState::Combat),
+            (despawn_all::<CombatScreen>, stop_audio_on_exit),
+        )
         .add_systems(OnEnter(AppState::End), end_setup)
         .add_systems(OnExit(AppState::End), despawn_all::<EndScreen>)
         // One chain: total ordering silences cross-system borrow ambiguity.
@@ -1160,12 +1595,17 @@ fn main() {
             Update,
             (
                 title_keys.run_if(in_state(AppState::Title)),
+                pause_toggle.run_if(in_state(AppState::Explore)),
+                pause_buttons.run_if(in_state(AppState::Explore)),
                 explore_move.run_if(in_state(AppState::Explore)),
                 explore_hud.run_if(in_state(AppState::Explore)),
+                tick_combat_clock,
                 combat_keys.run_if(in_state(AppState::Combat)),
                 combat_buttons.run_if(in_state(AppState::Combat)),
+                combat_button_tint.run_if(in_state(AppState::Combat)),
                 combat_hud.run_if(in_state(AppState::Combat)),
                 foe_pulse.run_if(in_state(AppState::Combat)),
+                bard_note_rise_fade,
                 ember_drift,
                 end_keys.run_if(in_state(AppState::End)),
             )
@@ -1193,6 +1633,7 @@ mod host_tests {
             player: IVec2::new(MAP_W / 2, MAP_H / 2),
             map,
             song_idx: 1,
+            last_bard: None,
         }
     }
 
@@ -1237,7 +1678,14 @@ mod host_tests {
         let bus = SoundBus::spawn();
         let mut next = NextState::<AppState>::default();
         let turns_before = session.game.hero.turns;
-        do_hero_action(&mut session, &backend, &bus, Action::Strike, &mut next);
+        do_hero_action(
+            &mut session,
+            &backend,
+            &bus,
+            Action::Strike,
+            Some(0.44),
+            &mut next,
+        );
         assert!(session.game.hero.turns > turns_before);
         assert!(!session.log.is_empty());
     }
@@ -1249,5 +1697,143 @@ mod host_tests {
             push_log(&mut s, format!("line {i}"));
         }
         assert_eq!(s.log.len(), 40);
+    }
+
+    #[test]
+    fn bard_beat_updates_session_and_log() {
+        let mut session = test_session(11);
+        let bus = SoundBus::spawn();
+        let events = vec![Event::BardBeat {
+            track: 0,
+            note_idx: 10,
+            midi: 81,
+            zone: BardZone::High,
+        }];
+        apply_events(&mut session, &bus, events);
+        assert_eq!(session.last_bard, Some((BardZone::High, 81)));
+        assert!(session.log.iter().any(|l| l.contains("high verse")));
+
+        let mut session = test_session(11);
+        let events = vec![Event::BardBeat {
+            track: 0,
+            note_idx: 0,
+            midi: 57,
+            zone: BardZone::Low,
+        }];
+        apply_events(&mut session, &bus, events);
+        assert_eq!(session.last_bard, Some((BardZone::Low, 57)));
+        assert!(session.log.iter().any(|l| l.contains("low verse")));
+
+        // Steady verses update state but stay out of the log.
+        let mut session = test_session(11);
+        let events = vec![Event::BardBeat {
+            track: 0,
+            note_idx: 5,
+            midi: 69,
+            zone: BardZone::Mid,
+        }];
+        apply_events(&mut session, &bus, events);
+        assert_eq!(session.last_bard, Some((BardZone::Mid, 69)));
+    }
+
+    #[test]
+    fn lighting_modes_differ_and_stay_bright() {
+        assert_eq!(lighting_for_vault(1), LightingMode::Outdoor);
+        assert_eq!(lighting_for_vault(0), LightingMode::Dungeon);
+        assert_eq!(lighting_for_vault(2), LightingMode::Dungeon);
+        // Both backdrops must be far brighter than the old 0.02/0.01/0.06.
+        for mode in [LightingMode::Dungeon, LightingMode::Outdoor] {
+            let c = combat_backdrop(mode);
+            let s = c.to_srgba();
+            assert!(
+                s.red > 0.08 && s.green > 0.06 && s.blue > 0.15,
+                "{mode:?} still too dark"
+            );
+        }
+        assert_ne!(
+            combat_backdrop(LightingMode::Dungeon),
+            combat_backdrop(LightingMode::Outdoor)
+        );
+    }
+
+    #[test]
+    fn hero_line_names_battle_track() {
+        let s = test_session(7);
+        let line = hero_line(&s.game);
+        assert!(line.contains("Ember Vanguard March"), "{line}");
+    }
+
+    #[test]
+    fn music_restarts_only_on_track_change() {
+        // Fresh combat has nothing playing: first sighting records, no restart.
+        assert!(needs_music_restart(None, 0));
+        assert!(!needs_music_restart(Some(0), 0));
+        // Kill/bind picks a new track mid-Combat: restart.
+        // Single-track build today, but the helper must already handle it.
+        assert!(needs_music_restart(Some(1), 0));
+        assert!(!needs_music_restart(Some(0), 0));
+    }
+
+    #[test]
+    fn pause_menu_starts_closed_and_blocks_input() {
+        let paused = PauseMenu::default();
+        assert!(!paused.open);
+        assert!(!explore_blocked(&paused));
+        let open = PauseMenu { open: true };
+        assert!(explore_blocked(&open));
+    }
+
+    #[test]
+    fn combat_clock_starts_with_no_music() {
+        let clock = CombatClock::default();
+        assert_eq!(clock.elapsed, 0.0);
+        assert_eq!(clock.music_track, None);
+        assert_eq!(clock.cooldown, 0.0);
+    }
+
+    #[test]
+    fn action_cooldown_tracks_sound_but_stays_playable() {
+        use embersong_core::SoundTrigger;
+        // Silence still costs the floor, so machine-gunning is impossible.
+        assert_eq!(action_cooldown(&[]), 0.15);
+        // A lone miss blip floors too.
+        let miss = vec![Event::Sound(SoundTrigger::Miss)];
+        assert_eq!(action_cooldown(&miss), 0.15);
+        // A typical strike turn trails its sounds at 0.6x: snappy, not lapping.
+        let turn = vec![
+            Event::Sound(SoundTrigger::Strike),
+            Event::Sound(SoundTrigger::HeroHurt),
+        ];
+        let cd = action_cooldown(&turn);
+        assert!(cd > 0.15 && cd < 0.65, "{cd}");
+        // A huge turn (kill + victory sting) caps instead of freezing input.
+        let big = vec![
+            Event::Sound(SoundTrigger::Strike),
+            Event::Sound(SoundTrigger::MonsterDie),
+            Event::Sound(SoundTrigger::Victory),
+        ];
+        assert_eq!(action_cooldown(&big), 0.65);
+        // Non-sound events don't extend the wait.
+        let chat = vec![Event::Message("hi".into())];
+        assert_eq!(action_cooldown(&chat), 0.15);
+    }
+
+    #[test]
+    fn buttons_dim_while_cooling_then_restore() {
+        use Interaction::{Hovered, None, Pressed};
+        // Cooling beats every interaction state.
+        for i in [None, Hovered, Pressed] {
+            assert_eq!(combat_button_color(true, &i), BTN_DISABLED);
+        }
+        // Ready restores the familiar mapping.
+        assert_eq!(combat_button_color(false, &None), BTN_NORMAL);
+        assert_eq!(combat_button_color(false, &Hovered), BTN_HOVER);
+        assert_eq!(combat_button_color(false, &Pressed), BTN_DOWN);
+        // Disabled is visibly darker than every live state.
+        let d = BTN_DISABLED.to_srgba();
+        for live in [BTN_NORMAL, BTN_HOVER, BTN_DOWN] {
+            let l = live.to_srgba();
+            assert!(d.red < l.red && d.green < l.green && d.blue < l.blue);
+        }
     }
 }

@@ -22,7 +22,13 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "op")]
 pub enum Command {
     /// Run one hero turn: `{ "op": "act", "action": <Action> }`.
-    Act { action: Action },
+    /// `beat_time` is the wall-clock seconds since the fight started;
+    /// `None`/absent falls back to the turn-stepped bard clock.
+    Act {
+        action: Action,
+        #[serde(default)]
+        beat_time: Option<f32>,
+    },
     /// Fresh run: `{ "op": "new", "seed": 123 }`.
     New { seed: u64 },
 }
@@ -41,9 +47,9 @@ pub fn dispatch(state: &Game, cmd: &Command) -> CommandResult {
             state: Game::new(*seed),
             events: vec![],
         },
-        Command::Act { action } => {
+        Command::Act { action, beat_time } => {
             let mut state = state.clone();
-            let events = state.act(*action);
+            let events = state.act_at(*action, *beat_time);
             CommandResult { state, events }
         }
     }
@@ -140,12 +146,17 @@ mod tests {
         // Strike turn via JSON (the exact bytes the host sends).
         let cmd = serde_json::to_vec(&Command::Act {
             action: Action::Strike,
+            beat_time: Some(0.44),
         })
         .unwrap();
         let state: Game = serde_json::from_slice(&state_json).unwrap();
         let cmd_decoded: Command = serde_json::from_slice(&cmd).unwrap();
         let r = dispatch(&state, &cmd_decoded);
         assert!(!r.events.is_empty());
+        assert!(r
+            .events
+            .iter()
+            .any(|e| matches!(e, embersong_core::Event::BardBeat { .. })));
         let _ = serde_json::to_vec(&r).unwrap();
     }
 
@@ -156,6 +167,7 @@ mod tests {
             &g,
             &Command::Act {
                 action: Action::Song(Song::MothLullaby),
+                beat_time: None,
             },
         );
         assert!(!r.events.is_empty());
@@ -163,8 +175,18 @@ mod tests {
             &r.state,
             &Command::Act {
                 action: Action::Soothe,
+                beat_time: None,
             },
         );
+        assert!(!r.events.is_empty());
+    }
+
+    #[test]
+    fn dispatch_legacy_act_without_beat_time() {
+        // Pre-bard hosts send act with no clock.
+        let g = Game::new(7);
+        let cmd: Command = serde_json::from_str(r#"{"op":"Act","action":"Strike"}"#).unwrap();
+        let r = dispatch(&g, &cmd);
         assert!(!r.events.is_empty());
     }
 }

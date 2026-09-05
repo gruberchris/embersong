@@ -127,7 +127,41 @@ pub fn render_sfx(trigger: SoundTrigger) -> Sound {
         SoundTrigger::Flee => shimmer(&[523.0, 392.0, 262.0], 0.5, rate),
         SoundTrigger::Victory => shimmer(&[523.0, 659.0, 784.0, 1047.0, 1319.0], 1.2, rate),
         SoundTrigger::Defeat => shimmer(&[392.0, 330.0, 262.0, 196.0], 1.2, rate),
+        SoundTrigger::BardHigh => shimmer(&[659.0, 784.0, 988.0, 1319.0], 0.5, rate),
+        SoundTrigger::BardLow => mix(pluck(98.0, 0.4, rate, 0.6), thump(0.25, rate, 31)),
     };
+    Sound { samples, rate }
+}
+
+/// Playback length of a one-shot effect in seconds, for UI pacing
+/// (action cooldowns). Renders the effect and measures it, so the value
+/// can never drift from what the audio thread actually plays.
+pub fn sfx_duration(trigger: SoundTrigger) -> f32 {
+    let s = render_sfx(trigger);
+    s.samples.len() as f32 / s.rate.max(1) as f32
+}
+
+/// MIDI note to frequency (A4 = 440Hz).
+pub fn midi_to_freq(midi: u8) -> f32 {
+    440.0 * 2.0f32.powf((midi as f32 - 69.0) / 12.0)
+}
+
+/// Render a battle song track loop: `bars` repeats of the track's note
+/// sequence. Adding a song = adding its table in `embersong-core`; this
+/// function needs no changes.
+pub fn render_battle_track(track_idx: u32, bars: usize) -> Sound {
+    let rate = SAMPLE_RATE;
+    let t = embersong_core::battle_track(track_idx);
+    let mut samples = Vec::new();
+    for _ in 0..bars.max(1) {
+        for m in t.notes {
+            samples.extend(pluck(midi_to_freq(*m), t.note_dur, rate, 0.4));
+        }
+    }
+    let fade = (0.1 * rate as f32) as usize;
+    for (i, s) in samples.iter_mut().rev().take(fade).enumerate() {
+        *s *= 1.0 - i as f32 / fade as f32;
+    }
     Sound { samples, rate }
 }
 
@@ -173,6 +207,8 @@ mod tests {
             SoundTrigger::Flee,
             SoundTrigger::Victory,
             SoundTrigger::Defeat,
+            SoundTrigger::BardHigh,
+            SoundTrigger::BardLow,
         ];
         for t in triggers {
             let s = render_sfx(t);
@@ -194,5 +230,62 @@ mod tests {
         assert!(battle.samples.iter().any(|v| v.abs() > 0.01));
         // Tail fades to near-silence for click-free loops.
         assert!(calm.samples.last().copied().unwrap_or(1.0).abs() < 0.05);
+    }
+
+    #[test]
+    fn battle_track_renders_and_loops_cleanly() {
+        let s = render_battle_track(0, 2);
+        assert!(!s.samples.is_empty());
+        assert!(s.samples.iter().any(|v| v.abs() > 0.01));
+        assert!(s.samples.iter().all(|v| v.is_finite()));
+        assert!(s.samples.last().copied().unwrap_or(1.0).abs() < 0.05);
+        // Out-of-range track falls back to the test track (registry grows here).
+        let fallback = render_battle_track(99, 1);
+        assert!(!fallback.samples.is_empty());
+    }
+
+    #[test]
+    fn battle_track_single_loop_is_compact() {
+        // The music sink repeats one loop gaplessly, so combat renders stay
+        // small (fast fight entry, tiny queue).
+        let s = render_battle_track(0, 1);
+        let secs = s.samples.len() as f32 / s.rate as f32;
+        assert!(secs > 1.0 && secs < 6.0, "{secs}s");
+    }
+
+    #[test]
+    fn midi_to_freq_matches_a440() {
+        assert!((midi_to_freq(69) - 440.0).abs() < 0.5);
+        assert!(midi_to_freq(81) > midi_to_freq(57));
+    }
+
+    #[test]
+    fn sfx_durations_are_sane_and_match_render() {
+        // Every trigger must report the length it really plays: short blips
+        // well under a second, stings capped for cooldown math.
+        for t in [
+            SoundTrigger::Strike,
+            SoundTrigger::HeroHurt,
+            SoundTrigger::MonsterDie,
+            SoundTrigger::Heal,
+            SoundTrigger::Miss,
+            SoundTrigger::Tame,
+            SoundTrigger::Song,
+            SoundTrigger::Enrage,
+            SoundTrigger::Flee,
+            SoundTrigger::Victory,
+            SoundTrigger::Defeat,
+            SoundTrigger::BardHigh,
+            SoundTrigger::BardLow,
+        ] {
+            let d = sfx_duration(t);
+            assert!(d > 0.05 && d < 1.5, "{t:?} duration {d}");
+            let s = render_sfx(t);
+            let expect = s.samples.len() as f32 / s.rate as f32;
+            assert!((d - expect).abs() < f32::EPSILON, "{t:?}");
+        }
+        // Spot checks the cooldown math relies on.
+        assert!(sfx_duration(SoundTrigger::Miss) < 0.2);
+        assert!(sfx_duration(SoundTrigger::Victory) > 1.0);
     }
 }

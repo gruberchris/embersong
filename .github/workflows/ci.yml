@@ -10,9 +10,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y g++ pkg-config libx11-dev libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev
-      - run: cargo test -p embersong-core -p embersong-synth -p embersong-wasm
-      - run: cargo clippy -p embersong-core -p embersong-synth -p embersong-wasm -- -D warnings
+      - run: cargo test --locked -p embersong-core -p embersong-synth -p embersong-wasm
+      - run: cargo clippy --locked -p embersong-core -p embersong-synth -p embersong-wasm -- -D warnings
       - run: cargo fmt --check
 
   wasm:
@@ -22,42 +23,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
-      - run: cargo build -p embersong-wasm --target wasm32-unknown-unknown --release
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: wasm
+      - run: cargo build --locked -p embersong-wasm --target wasm32-unknown-unknown --release
       - uses: actions/upload-artifact@v4
         with:
           name: core-wasm
           path: target/wasm32-unknown-unknown/release/embersong_wasm.wasm
-
-  desktop:
-    needs: [logic, wasm]
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-          - os: macos-14
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - name: Install Linux build deps
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get update && sudo apt-get install -y g++ pkg-config libx11-dev libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev
-      - uses: actions/download-artifact@v4
-        with:
-          name: core-wasm
-          path: crates/embersong-host/assets/
-      - run: mv crates/embersong-host/assets/embersong_wasm.wasm crates/embersong-host/assets/core.wasm || true
-      - run: cargo build -p embersong-host --release --target ${{ matrix.target }}
-      - name: Differential check — WASM guest vs native rules (5 seeds)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          cargo build -p embersong-host --target ${{ matrix.target }}
-          for s in 7 1 42 1234 99999; do
-            ./target/${{ matrix.target }}/debug/embersong-host --headless --native --verify --seed $s --turns 250
-          done

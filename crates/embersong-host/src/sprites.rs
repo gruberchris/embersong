@@ -575,6 +575,38 @@ pub fn draw_glow() -> Canvas {
     c
 }
 
+/// Floating bard note: bright gold + cyan glow for bonuses,
+/// deep indigo + blood shadow for penalties. 24x28 eighth-note.
+pub fn draw_note(bright: bool) -> Canvas {
+    let mut c = Canvas::new(24, 28);
+    let (body, glow, detail) = if bright {
+        (
+            (255, 220, 120, 255),
+            (120, 230, 255, 90),
+            (255, 252, 235, 255),
+        )
+    } else {
+        ((52, 40, 96, 255), (202, 32, 44, 80), (20, 14, 36, 255))
+    };
+    // Glow halo.
+    c.disc(12, 14, 10, glow);
+    // Stem.
+    c.vline(17, 4, 20, body);
+    // Flag.
+    c.tri_up(17, 4, 5, 5, body);
+    // Head.
+    c.ell(10, 21, 7, 5, body);
+    c.ell(10, 21, 4, 3, detail);
+    // Sparkle for bright, crack for dark.
+    if bright {
+        c.set(7, 8, (255, 255, 255, 255));
+        c.set(16, 12, (255, 255, 255, 255));
+    } else {
+        c.hline(6, 14, 21, detail);
+    }
+    c
+}
+
 /// Floor tint per element so dens read as territory, not just tokens.
 pub fn element_floor(e: Element) -> Color {
     let (r, g, b, a) = match e {
@@ -609,6 +641,8 @@ pub struct SpriteSet {
     pub creatures: HashMap<MonsterKind, Handle<Image>>,
     pub hero: Handle<Image>,
     pub glow: Handle<Image>,
+    pub note_high: Handle<Image>,
+    pub note_low: Handle<Image>,
     pub floor_a: Handle<Image>,
     pub floor_b: Handle<Image>,
     pub wall: Handle<Image>,
@@ -622,6 +656,14 @@ impl SpriteSet {
             .cloned()
             .unwrap_or_else(|| self.hero.clone())
     }
+
+    pub fn bard_note(&self, bright: bool) -> Handle<Image> {
+        if bright {
+            self.note_high.clone()
+        } else {
+            self.note_low.clone()
+        }
+    }
 }
 
 /// Build every texture once at startup.
@@ -634,6 +676,8 @@ pub fn build_sprites(mut commands: Commands, mut images: ResMut<Assets<Image>>) 
         creatures,
         hero: images.add(draw_hero_sprite().into_image()),
         glow: images.add(draw_glow().into_image()),
+        note_high: images.add(draw_note(true).into_image()),
+        note_low: images.add(draw_note(false).into_image()),
         floor_a: images.add(draw_floor(0).into_image()),
         floor_b: images.add(draw_floor(1).into_image()),
         wall: images.add(draw_wall().into_image()),
@@ -676,6 +720,34 @@ mod tests {
         assert!(draw_floor(0).coverage() > 0.9);
         assert!(draw_wall().coverage() > 0.9);
         assert!(draw_stairs().coverage() > 0.3);
+    }
+
+    #[test]
+    fn bard_notes_read_as_sprites() {
+        let high = draw_note(true);
+        let low = draw_note(false);
+        assert!(high.coverage() > 0.05, "bright note empty");
+        assert!(low.coverage() > 0.05, "dark note empty");
+        // Bright note must carry vivid highlight pixels; dark must stay dim.
+        let high_bright = high
+            .buf
+            .chunks_exact(4)
+            .any(|p| p[3] > 200 && p[0] > 230 && p[1] > 200);
+        assert!(high_bright, "bright note has no gold highlight");
+        let low_luma: u32 = low
+            .buf
+            .chunks_exact(4)
+            .map(|p| p[0] as u32 + p[1] as u32 + p[2] as u32)
+            .sum();
+        let high_luma: u32 = high
+            .buf
+            .chunks_exact(4)
+            .map(|p| p[0] as u32 + p[1] as u32 + p[2] as u32)
+            .sum();
+        assert!(
+            high_luma > low_luma,
+            "bright note should outshine dark note"
+        );
     }
 
     #[test]
