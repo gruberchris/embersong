@@ -205,6 +205,8 @@ struct SongLabel;
 #[derive(Component)]
 struct FoeName;
 #[derive(Component)]
+struct TrackLabel;
+#[derive(Component)]
 struct CombatFoe;
 #[derive(Component)]
 struct PlayerToken;
@@ -411,7 +413,7 @@ fn save_game(game: &Game) {
 fn hero_line(game: &Game) -> String {
     let vault = &Game::vaults()[game.vault_index];
     format!(
-        "HP {}/{}   Breath {}/{}   Binds {}   Shards {}   Companions {}   Bestiary {}/12\n{} (vault {}/{})\n♪ {}",
+        "HP {}/{}   Breath {}/{}   Binds {}   Shards {}   Companions {}   Bestiary {}/12\n{} (vault {}/{})",
         game.hero.hp,
         game.hero.max_hp,
         game.hero.breath,
@@ -423,8 +425,26 @@ fn hero_line(game: &Game) -> String {
         vault.name,
         game.vault_index + 1,
         Game::vaults().len(),
-        embersong_core::battle_track_name(game.battle_track),
     )
+}
+
+/// Overworld HUD body: hero stats only. The upcoming foe stays hidden —
+/// monster name/HP/Harmony appear only once combat starts.
+fn explore_body(game: &Game) -> String {
+    hero_line(game)
+}
+
+/// Now-playing readout for the combat screen's right edge: the battle track
+/// plus the last bard verse, so the top-left HUD stays about the fighters.
+fn track_text(session: &Session) -> String {
+    let mut s = format!(
+        "♪ {}",
+        embersong_core::battle_track_name(session.game.battle_track)
+    );
+    if let Some((zone, midi)) = session.last_bard {
+        s.push_str(&format!("\nlast verse: {} ({midi})", zone.label()));
+    }
+    s
 }
 
 fn foe_line(game: &Game) -> String {
@@ -995,7 +1015,7 @@ fn explore_hud(
     mut hud: Query<&mut Text, (With<HudMain>, Without<HudLog>)>,
     mut log: Query<&mut Text, With<HudLog>>,
 ) {
-    let body = format!("{}\n{}", hero_line(&session.game), foe_line(&session.game));
+    let body = explore_body(&session.game);
     for mut t in &mut hud {
         t.0 = body.clone();
     }
@@ -1207,6 +1227,22 @@ fn combat_setup(
         .with_children(|p| {
             p.spawn((Text::new(""), f_log, c_log, HudLog));
         });
+    // Now-playing readout on the far right, clear of the left HUD + log.
+    let (f_track, c_track) = font(&asset_server, 16.0, Color::srgb(1.0, 0.88, 0.6));
+    commands
+        .spawn((
+            Node {
+                position_type: PositionType::Absolute,
+                right: Val::Px(12.0),
+                top: Val::Px(10.0),
+                width: Val::Px(300.0),
+                ..default()
+            },
+            CombatScreen,
+        ))
+        .with_children(|p| {
+            p.spawn((Text::new(""), f_track, c_track, TrackLabel));
+        });
 }
 
 #[allow(clippy::type_complexity)] // Bevy HUD queries.
@@ -1222,11 +1258,30 @@ fn combat_hud(
             Without<HudLog>,
             Without<SongLabel>,
             Without<FoeName>,
+            Without<TrackLabel>,
         ),
     >,
-    mut log: Query<&mut Text, (With<HudLog>, Without<SongLabel>, Without<FoeName>)>,
-    mut song: Query<&mut Text, (With<SongLabel>, Without<FoeName>)>,
-    mut nameplate: Query<&mut Text, With<FoeName>>,
+    mut log: Query<
+        &mut Text,
+        (
+            With<HudLog>,
+            Without<SongLabel>,
+            Without<FoeName>,
+            Without<TrackLabel>,
+        ),
+    >,
+    mut song: Query<&mut Text, (With<SongLabel>, Without<FoeName>, Without<TrackLabel>)>,
+    mut track: Query<
+        &mut Text,
+        (
+            With<TrackLabel>,
+            Without<HudMain>,
+            Without<HudLog>,
+            Without<SongLabel>,
+            Without<FoeName>,
+        ),
+    >,
+    mut nameplate: Query<&mut Text, (With<FoeName>, Without<TrackLabel>)>,
     mut foe: Query<&mut Sprite, With<CombatFoe>>,
     mut last_kind: Local<Option<MonsterKind>>,
 ) {
@@ -1236,6 +1291,10 @@ fn combat_hud(
     }
     for mut t in &mut hud {
         t.0 = body.clone();
+    }
+    let track_body = track_text(&session);
+    for mut t in &mut track {
+        t.0 = track_body.clone();
     }
     let tail: Vec<&str> = session
         .log
@@ -1757,10 +1816,30 @@ mod host_tests {
     }
 
     #[test]
-    fn hero_line_names_battle_track() {
+    fn track_text_names_battle_track() {
         let s = test_session(7);
-        let line = hero_line(&s.game);
+        let line = track_text(&s);
         assert!(line.contains("Ember Vanguard March"), "{line}");
+        assert!(!line.contains("resolving"));
+        // After a bard beat it also reports the last verse.
+        let mut rung = test_session(7);
+        rung.last_bard = Some((BardZone::High, 81));
+        let line = track_text(&rung);
+        assert!(line.contains("high verse") && line.contains("81"), "{line}");
+    }
+
+    #[test]
+    fn explore_hides_foe_and_song() {
+        // The overworld must not leak the upcoming encounter or the song.
+        let s = test_session(7);
+        assert!(s.game.current.is_some(), "fixture needs a staged foe");
+        let body = explore_body(&s.game);
+        assert!(!body.contains("☠"), "{body}");
+        assert!(!body.contains("Harmony"), "{body}");
+        assert!(!body.contains("♪"), "{body}");
+        assert!(body.contains("HP"), "{body}");
+        // Combat still shows the foe.
+        assert!(foe_line(&s.game).contains("Harmony"));
     }
 
     #[test]
@@ -1789,6 +1868,31 @@ mod host_tests {
         assert_eq!(clock.elapsed, 0.0);
         assert_eq!(clock.music_track, None);
         assert_eq!(clock.cooldown, 0.0);
+    }
+
+    #[test]
+    fn combat_hud_system_params_do_not_conflict() {
+        // Regression: the TrackLabel query overlapped the other &mut Text
+        // queries (B0001) and crashed on launch. System init runs the same
+        // access-compatibility check the schedule runs, so this fails here
+        // instead of in the player's face.
+        use bevy::ecs::system::{IntoSystem, System};
+        let mut world = World::new();
+        world.insert_resource(test_session(7));
+        world.insert_resource(SpriteSet {
+            creatures: std::collections::HashMap::new(),
+            hero: Handle::default(),
+            glow: Handle::default(),
+            note_high: Handle::default(),
+            note_low: Handle::default(),
+            floor_a: Handle::default(),
+            floor_b: Handle::default(),
+            wall: Handle::default(),
+            stairs: Handle::default(),
+        });
+        world.insert_resource(CombatClock::default());
+        let mut system = IntoSystem::into_system(combat_hud);
+        system.initialize(&mut world);
     }
 
     #[test]
