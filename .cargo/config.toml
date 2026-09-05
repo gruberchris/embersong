@@ -2,3 +2,7 @@
 # it targets `wasm32-unknown-unknown` (zero imports) and aborts on panic.
 [target.wasm32-unknown-unknown]
 rustflags = ["-C", "panic=abort"]
+
+# Task runner: `cargo xtask <dist | verify>`.
+[alias]
+xtask = "run --quiet --package xtask --"

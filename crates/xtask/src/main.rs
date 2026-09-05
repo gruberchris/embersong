@@ -1,24 +1,112 @@
-//! `cargo xtask dist` — copy the built host binary + `core.wasm` into `dist/`.
+//! `cargo xtask <cmd>` — repo task runner.
+//!
+//! - `dist [--target <triple>]`: copy the built host binary + `core.wasm` into `dist/`.
+//! - `verify [--turns N] [--seeds a,b,c]`: rebuild the WASM guest, stage it
+//!   for the host, build the host, and run the native-vs-WASM differential
+//!   check (the gate CI used to run on Ubuntu).
 
 use std::path::PathBuf;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(|s| s.as_str()) != Some("dist") {
-        eprintln!("usage: cargo xtask dist [--target <triple>]");
-        std::process::exit(2);
+    match args.get(1).map(|s| s.as_str()) {
+        Some("dist") => dist(&args),
+        Some("verify") => verify(&args),
+        _ => {
+            eprintln!("usage: cargo xtask <dist [--target <triple>] | verify [--turns N] [--seeds a,b,c]>");
+            std::process::exit(2);
+        }
     }
-    let target = args
-        .windows(2)
-        .find(|w| w[0] == "--target")
-        .map(|w| w[1].clone());
+}
 
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
         .parent()
         .unwrap()
-        .to_path_buf();
+        .to_path_buf()
+}
+
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2).find(|w| w[0] == flag).map(|w| w[1].clone())
+}
+
+fn run(cmd: &str, args: &[&str], dir: &std::path::Path) {
+    println!("+ {cmd} {}", args.join(" "));
+    let status = std::process::Command::new(cmd)
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .unwrap_or_else(|e| {
+            eprintln!("cannot run {cmd}: {e}");
+            std::process::exit(1);
+        });
+    if !status.success() {
+        eprintln!("{cmd} failed: {status}");
+        std::process::exit(status.code().unwrap_or(1));
+    }
+}
+
+fn verify(args: &[String]) {
+    let root = workspace_root();
+    let turns = flag_value(args, "--turns").unwrap_or_else(|| "250".to_string());
+    let seeds = flag_value(args, "--seeds").unwrap_or_else(|| "7,1,42,1234,99999".to_string());
+
+    // The guest must be fresh: the host silently falls back to native when
+    // core.wasm is missing, and --verify refuses without it.
+    run(
+        "cargo",
+        &[
+            "build",
+            "--locked",
+            "-p",
+            "embersong-wasm",
+            "--target",
+            "wasm32-unknown-unknown",
+            "--release",
+        ],
+        &root,
+    );
+    let built = root.join("target/wasm32-unknown-unknown/release/embersong_wasm.wasm");
+    let staged = root.join("crates/embersong-host/assets/core.wasm");
+    std::fs::copy(&built, &staged).unwrap_or_else(|e| {
+        eprintln!("cannot stage {}: {e}", staged.display());
+        std::process::exit(1);
+    });
+    println!("staged {}", staged.display());
+
+    run(
+        "cargo",
+        &["build", "--locked", "-p", "embersong-host"],
+        &root,
+    );
+
+    let bin = root.join("target/debug").join(format!(
+        "embersong-host{}",
+        if cfg!(windows) { ".exe" } else { "" }
+    ));
+    for seed in seeds.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        run(
+            bin.to_str().unwrap(),
+            &[
+                "--headless",
+                "--native",
+                "--verify",
+                "--seed",
+                seed,
+                "--turns",
+                &turns,
+            ],
+            &root,
+        );
+    }
+    println!("verify clean: seeds [{seeds}] x {turns} turns");
+}
+
+fn dist(args: &[String]) {
+    let target = flag_value(args, "--target");
+    let root = workspace_root();
     // Prefer the triple-qualified dir (`--target <triple>` builds), fall back
     // to the plain profile dir (bare `cargo build --release`).
     let candidates = match &target {
