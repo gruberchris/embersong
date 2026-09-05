@@ -1258,12 +1258,30 @@ fn combat_hud(
             Without<HudLog>,
             Without<SongLabel>,
             Without<FoeName>,
+            Without<TrackLabel>,
         ),
     >,
-    mut log: Query<&mut Text, (With<HudLog>, Without<SongLabel>, Without<FoeName>)>,
-    mut song: Query<&mut Text, (With<SongLabel>, Without<FoeName>)>,
-    mut track: Query<&mut Text, (With<TrackLabel>, Without<FoeName>)>,
-    mut nameplate: Query<&mut Text, With<FoeName>>,
+    mut log: Query<
+        &mut Text,
+        (
+            With<HudLog>,
+            Without<SongLabel>,
+            Without<FoeName>,
+            Without<TrackLabel>,
+        ),
+    >,
+    mut song: Query<&mut Text, (With<SongLabel>, Without<FoeName>, Without<TrackLabel>)>,
+    mut track: Query<
+        &mut Text,
+        (
+            With<TrackLabel>,
+            Without<HudMain>,
+            Without<HudLog>,
+            Without<SongLabel>,
+            Without<FoeName>,
+        ),
+    >,
+    mut nameplate: Query<&mut Text, (With<FoeName>, Without<TrackLabel>)>,
     mut foe: Query<&mut Sprite, With<CombatFoe>>,
     mut last_kind: Local<Option<MonsterKind>>,
 ) {
@@ -1850,6 +1868,31 @@ mod host_tests {
         assert_eq!(clock.elapsed, 0.0);
         assert_eq!(clock.music_track, None);
         assert_eq!(clock.cooldown, 0.0);
+    }
+
+    #[test]
+    fn combat_hud_system_params_do_not_conflict() {
+        // Regression: the TrackLabel query overlapped the other &mut Text
+        // queries (B0001) and crashed on launch. System init runs the same
+        // access-compatibility check the schedule runs, so this fails here
+        // instead of in the player's face.
+        use bevy::ecs::system::{IntoSystem, System};
+        let mut world = World::new();
+        world.insert_resource(test_session(7));
+        world.insert_resource(SpriteSet {
+            creatures: std::collections::HashMap::new(),
+            hero: Handle::default(),
+            glow: Handle::default(),
+            note_high: Handle::default(),
+            note_low: Handle::default(),
+            floor_a: Handle::default(),
+            floor_b: Handle::default(),
+            wall: Handle::default(),
+            stairs: Handle::default(),
+        });
+        world.insert_resource(CombatClock::default());
+        let mut system = IntoSystem::into_system(combat_hud);
+        system.initialize(&mut world);
     }
 
     #[test]
